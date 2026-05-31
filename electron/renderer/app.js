@@ -48,12 +48,22 @@ function shortPath(p) {
   return '.../' + parts.slice(-2).join('/');
 }
 
+const LOG_MAX_LINES = 100;
+const SETUP_LOG_MAX_LINES = 50;
+
+function trimLogLines(container, maxLines) {
+  while (container.childNodes.length > maxLines) {
+    container.removeChild(container.firstChild);
+  }
+}
+
 function appendLog(level, message) {
   if (!message.trim()) return;
   const line = document.createElement('div');
   line.className = `log-line-${level}`;
   line.textContent = message;
   logOutput.appendChild(line);
+  trimLogLines(logOutput, LOG_MAX_LINES);
   logOutput.scrollTop = logOutput.scrollHeight;
   if (isProcessing && (level === 'info' || level === 'warn')) {
     setProcessingMessage(message);
@@ -62,7 +72,12 @@ function appendLog(level, message) {
 
 function appendSetupLog(message) {
   if (!message.trim()) return;
-  setupLog.textContent += (setupLog.textContent ? '\n' : '') + message;
+  const prefix = setupLog.textContent ? '\n' : '';
+  setupLog.textContent += prefix + message;
+  const lines = setupLog.textContent.split('\n');
+  if (lines.length > SETUP_LOG_MAX_LINES) {
+    setupLog.textContent = lines.slice(-SETUP_LOG_MAX_LINES).join('\n');
+  }
   setupLog.scrollTop = setupLog.scrollHeight;
 }
 
@@ -285,10 +300,14 @@ function bindEvents() {
 
   window.milfun.onProgress(({ step, total, message }) => {
     setProgress(step, total);
-    if (message) {
-      appendLog('info', message);
+    if (!message) return;
+    // 高频进度（UUID 替换）只更新底部状态，不刷屏
+    if (isProcessing && /^Replacing UUIDs \(/i.test(message)) {
       setProcessingMessage(message);
+      return;
     }
+    appendLog('info', message);
+    if (isProcessing) setProcessingMessage(message);
   });
 
   window.milfun.onProcessingState(({ running }) => {
@@ -386,7 +405,6 @@ function bindEvents() {
     logOutput.innerHTML = '';
     processedDir = '';
     setProgress(0, 5);
-    appendLog('info', 'MilFun Start...');
     const featureFlags = getFeatureFlagsFromUi();
     const result = await window.milfun.startProcessing({ sourceDir: sourcePath, featureFlags });
     if (!result.ok) {

@@ -79,7 +79,10 @@ function samePath(a, b) {
   return pa === pb;
 }
 
+const { shouldForwardLogToUI } = require('./log-filter');
+
 function logLine(level, message) {
+  if (!shouldForwardLogToUI(level, message)) return;
   send('log', { level, message });
 }
 
@@ -229,7 +232,6 @@ async function runPipelineInMain(options) {
     onLog: (level, message) => logLine(level, message),
     onProgress: (step, total, message) => {
       send('progress', { step, total, message });
-      if (message) logLine('info', message);
     },
   });
 
