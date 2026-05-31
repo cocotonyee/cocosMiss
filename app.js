@@ -265,11 +265,14 @@ function getCpuCount() {
 
 function getNativeConcurrency() {
   const cpus = getCpuCount();
-  if (process.platform === 'win32') return Math.min(4, Math.max(2, Math.floor(cpus / 2)));
-  return Math.min(8, Math.max(4, cpus - 1));
+  // Windows 上 Sharp 并发过高会极慢（磁盘/CPU 争抢）
+  if (process.platform === 'win32') return Math.min(2, Math.max(1, Math.floor(cpus / 4)));
+  return Math.min(6, Math.max(3, cpus - 2));
 }
 
 function getBundleConcurrency() {
+  const cpus = getCpuCount();
+  if (process.platform === 'win32') return Math.min(3, Math.max(2, Math.floor(cpus / 2)));
   return Math.min(6, Math.max(2, getCpuCount() - 1));
 }
 
@@ -364,9 +367,9 @@ function isInWhitelist(filePath) {
   return WHITELIST_CONFIG.some((pattern) => filePath.includes(pattern));
 }
 
-// ─── 图片微改色 + 重哈希（控制体积）────────────────────────
+// ─── 图片改色（客户强度 + 单次编码、尽量保持体积）────────────
 
-const IMAGE_MAX_SIZE_RATIO = 1.2;
+const IMAGE_SIZE_WARN_RATIO = 0.1;
 
 function randomColorModulation() {
   const { hueMax, brightPct, satPct } = buildImageColorRanges(getFeatureFlags().IMAGE_COLOR_INTENSITY);
@@ -377,90 +380,80 @@ function randomColorModulation() {
   };
 }
 
-function buildImageEncodeAttempts(ext, meta) {
+function buildImageEncodeOptions(ext, meta) {
   if (ext === '.jpg' || ext === '.jpeg') {
-    return [92, 88, 85, 82, 80, 78, 75, 72, 70].map((quality) => ({
-      format: 'jpeg',
-      options: { quality, mozjpeg: true, chromaSubsampling: '4:2:0' },
-    }));
+    let quality = 90;
+    if (Number.isFinite(meta.quality) && meta.quality > 0) {
+      quality = Math.min(100, Math.max(75, Math.round(meta.quality)));
+    }
+    const options = {
+      quality,
+      mozjpeg: true,
+      trellisQuantisation: true,
+      overshootDeringing: true,
+      optimizeScans: true,
+      chromaSubsampling: meta.chromaSubsampling === '4:4:4' ? '4:4:4' : '4:2:0',
+    };
+    if (meta.isProgressive) options.progressive = true;
+    return { type: 'jpeg', options };
   }
 
   const colors = meta.colours || meta.colors || 256;
-  const usePalette = Boolean(meta.palette) || colors <= 256;
-  const attempts = [];
+  const compressionLevel = Number.isFinite(meta.compression)
+    ? Math.min(9, Math.max(0, meta.compression))
+    : 9;
 
-  if (usePalette) {
-    attempts.push({
-      format: 'png',
-      options: { palette: true, colors: Math.min(colors, 256), compressionLevel: 9, effort: 10 },
-    });
+  if (meta.palette || colors <= 256) {
+    return {
+      type: 'png',
+      options: {
+        palette: true,
+        colors: Math.min(Math.max(colors, 2), 256),
+        compressionLevel,
+        effort: 7,
+      },
+    };
   }
-  attempts.push({
-    format: 'png',
-    options: { compressionLevel: 9, effort: 10, adaptiveFiltering: true },
-  });
-  attempts.push({
-    format: 'png',
-    options: { palette: true, colors: 256, compressionLevel: 9, effort: 10 },
-  });
-  if (colors > 128) {
-    attempts.push({
-      format: 'png',
-      options: { palette: true, colors: 128, compressionLevel: 9, effort: 10 },
-    });
-  }
-  attempts.push({
-    format: 'png',
-    options: { palette: true, colors: 64, compressionLevel: 9, effort: 10 },
-  });
-  attempts.push({
-    format: 'png',
-    options: { palette: true, colors: 32, compressionLevel: 9, effort: 10, dither: 0.4 },
-  });
 
-  return attempts;
+  return {
+    type: 'png',
+    options: {
+      compressionLevel,
+      effort: 7,
+      adaptiveFiltering: true,
+    },
+  };
 }
 
 async function rehashImage(inputPath, outputPath) {
   await ensureDirectoryExists(outputPath);
   const ext = path.extname(inputPath).toLowerCase();
   const originalSize = fs.statSync(inputPath).size;
+  const intensity = getFeatureFlags().IMAGE_COLOR_INTENSITY;
   const mod = randomColorModulation();
+  const started = Date.now();
   const meta = await getSharp()(inputPath).metadata();
-  const attempts = buildImageEncodeAttempts(ext, meta);
-  const sizeLimit = Math.ceil(originalSize * IMAGE_MAX_SIZE_RATIO);
+  const encode = buildImageEncodeOptions(ext, meta);
 
-  let bestBuffer = null;
-  let bestSize = Infinity;
+  let pipeline = getSharp()(inputPath).modulate(mod);
+  pipeline = encode.type === 'jpeg'
+    ? pipeline.removeAlpha().jpeg(encode.options)
+    : pipeline.png(encode.options);
 
-  for (const attempt of attempts) {
-    let pipeline = getSharp()(inputPath).modulate(mod);
-    pipeline = attempt.format === 'jpeg'
-      ? pipeline.jpeg(attempt.options)
-      : pipeline.png(attempt.options);
-    const buffer = await pipeline.toBuffer();
+  const buffer = await pipeline.toBuffer();
+  await fs.writeFile(outputPath, buffer);
 
-    if (buffer.length <= sizeLimit) {
-      await fs.writeFile(outputPath, buffer);
-      return;
-    }
-    if (buffer.length < bestSize) {
-      bestSize = buffer.length;
-      bestBuffer = buffer;
-    }
+  const ms = Date.now() - started;
+  const sizeDelta = (buffer.length - originalSize) / originalSize;
+  if (Math.abs(sizeDelta) > IMAGE_SIZE_WARN_RATIO) {
+    const sign = sizeDelta >= 0 ? '+' : '';
+    console.warn(
+      `Image size ${sign}${(sizeDelta * 100).toFixed(0)}% (强度${intensity}): ${path.basename(inputPath)} ${originalSize}→${buffer.length}B`,
+    );
   }
-
-  if (bestBuffer) {
-    await fs.writeFile(outputPath, bestBuffer);
-    if (bestSize > sizeLimit) {
-      console.warn(
-        `Image over ${IMAGE_MAX_SIZE_RATIO}x limit: ${path.basename(inputPath)} ${originalSize}→${bestSize}B`,
-      );
-    }
-    return;
+  if (ms > 2000) {
+    console.log(`Image done (${(ms / 1000).toFixed(1)}s): ${path.basename(inputPath)}`);
   }
-
-  throw new Error(`Image encode failed: ${path.basename(inputPath)}`);
 }
 
 async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
@@ -594,7 +587,12 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
   const newPath = path.join(newNativeSubDir, plan.newFileName);
 
   console.log(`Processing: ${file} → ${plan.newFileName}`);
+  const t0 = Date.now();
   await moveNativeFile(originalPath, newPath, fileExt);
+  const moveMs = Date.now() - t0;
+  if (moveMs > 3000 && FILE_EXTENSIONS.IMAGE.includes(fileExt)) {
+    console.log(`  ↳ image ${(moveMs / 1000).toFixed(1)}s: ${file}`);
+  }
 
   await migrateImportJson(subpackageDir, uuidAndExtra, plan.renamedUUID, firstTwoChars);
 
