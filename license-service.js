@@ -87,14 +87,18 @@ function getLicenseStorageDir() {
 }
 
 function resolvePublicKeyPath(appRoot) {
+  const resourcesRoot = process.env.MILFUN_APP_ROOT;
   const candidates = [
-    path.join(appRoot, 'public.key'),
+    process.env.MILFUN_PUBLIC_KEY_PATH,
+    resourcesRoot ? path.join(resourcesRoot, 'public.key') : null,
+    process.env.MILFUN_EXE_DIR ? path.join(process.env.MILFUN_EXE_DIR, 'public.key') : null,
+    appRoot ? path.join(appRoot, 'public.key') : null,
     path.join(__dirname, 'public.key'),
-  ];
+  ].filter(Boolean);
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
-  return candidates[0];
+  return candidates[0] || path.join(resourcesRoot || appRoot || '.', 'public.key');
 }
 
 function resolveLicensePath(appRoot) {

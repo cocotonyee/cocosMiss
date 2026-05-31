@@ -114,6 +114,7 @@ for (const file of mustStayInAsar) {
   }
 }
 const requiredInPackage = [
+  'public.key',
   'loader-core.js',
   'app.jsc',
   'config.js',

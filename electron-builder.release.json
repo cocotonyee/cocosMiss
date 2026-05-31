@@ -16,6 +16,7 @@
     "!src_processed/**/*",
     "!dist/**/*",
     "!README.md",
+    "public.key",
     "loader-core.js",
     "app.jsc",
     "config.js",

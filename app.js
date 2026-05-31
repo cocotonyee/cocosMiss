@@ -622,19 +622,21 @@ async function main(options = {}) {
 async function runPipeline(options = {}) {
   const appRoot = options.appRoot || getAppRoot();
   const outputDir = options.outputDir || appRoot;
+  const licenseRoot = options.licenseRoot || process.env.MILFUN_APP_ROOT || appRoot;
   const hooks = installLogHooks(options.onLog);
   try {
-    options.onProgress?.(0, 6, '正在验证授权...');
-    const licenseOpts = options.trustUiLicense ? { skipDevice: true } : {};
-    const license = await checkLicense(appRoot, licenseOpts);
-    if (!license.valid) throw new Error(license.reason || '许可证无效');
+    if (!options.trustUiLicense) {
+      options.onProgress?.(0, 6, '正在验证授权...');
+      const license = await checkLicense(licenseRoot, {});
+      if (!license.valid) throw new Error(license.reason || '许可证无效');
+    }
 
     options.onProgress?.(0, 6, '开始处理...');
     const processedDir = await main({ ...options, appRoot });
     options.onProgress?.(6, 6, '正在打包 ZIP...');
     const zipPath = await createFinalZip(processedDir, outputDir);
     console.log('\x1b[37m\x1b[44m %s \x1b[0m\x1b[37m\x1b[42m %s \x1b[0m', 'MilFun', 'Well Done!');
-    return { processedDir, zipPath, license };
+    return { processedDir, zipPath };
   } finally {
     restoreLogHooks(hooks);
   }

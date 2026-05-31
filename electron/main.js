@@ -220,6 +220,7 @@ async function runPipelineInMain(options) {
     sourceDir: options.sourceDir,
     processedDir: options.processedDir,
     outputDir: options.outputDir,
+    licenseRoot: getResourcesRoot(),
     trustUiLicense: true,
     onLog: (level, message) => logLine(level, message),
     onProgress: (step, total, message) => {
