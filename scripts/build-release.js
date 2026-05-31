@@ -44,6 +44,32 @@ function runElectronBuilder(args) {
   });
 }
 
+function smokeTestJsc(jscPath) {
+  const smokeScript = path.join(BACKUP_DIR, 'smoke-jsc.js');
+  fs.writeFileSync(
+    smokeScript,
+    `'use strict';
+require('bytenode');
+const core = require(${JSON.stringify(jscPath)});
+if (typeof core.runPipeline !== 'function') {
+  throw new Error('app.jsc 缺少 runPipeline 导出');
+}
+console.log('   app.jsc 加载验证通过');
+`,
+  );
+
+  const electronPath = require('electron');
+  try {
+    execSync(`"${electronPath}" "${smokeScript}"`, {
+      cwd: ROOT,
+      stdio: 'inherit',
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    });
+  } finally {
+    if (fs.existsSync(smokeScript)) fs.removeSync(smokeScript);
+  }
+}
+
 async function build() {
   if (!fs.existsSync(path.join(ROOT, 'public.key'))) {
     throw new Error('缺少 public.key，请先运行 license.js 生成密钥对');
@@ -69,14 +95,8 @@ async function build() {
   });
   console.log(`   字节码: ${(fs.statSync(APP_JSC).size / 1024).toFixed(1)}KB`);
 
-  console.log('\n🧪 [2.5/4] 验证 app.jsc 可加载...');
-  delete require.cache[require.resolve('bytenode')];
-  require('bytenode');
-  const smokeCore = require(APP_JSC);
-  if (typeof smokeCore.runPipeline !== 'function') {
-    throw new Error('app.jsc 缺少 runPipeline 导出，请检查混淆/编译配置');
-  }
-  console.log('   app.jsc 加载验证通过');
+  console.log('\n🧪 [2.5/4] 验证 app.jsc 可加载（Electron 运行时）...');
+  smokeTestJsc(APP_JSC);
 
   const platform = process.argv.includes('--win') ? '--win --x64' : process.argv.includes('--mac') ? '--mac' : '--mac';
 
