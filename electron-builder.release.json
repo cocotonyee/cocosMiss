@@ -29,10 +29,6 @@
     "node_modules/sharp/**/*",
     "node_modules/@img/**/*",
     "node_modules/bytenode/**/*",
-    "app.jsc",
-    "loader-core.js",
-    "config.js",
-    "license-service.js",
     "electron/**/*"
   ],
   "extraResources": [

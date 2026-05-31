@@ -103,27 +103,32 @@ for (const [method, channel] of Object.entries(eventMap)) {
   }
 }
 
-// 7. 打包必须包含的文件
+// 7. 核心文件应留在 app.asar 内（unpacked 会导致 app.jsc 找不到 fs-extra 等依赖）
 const builder = JSON.parse(read('electron-builder.release.json'));
-const requiredUnpack = [
-  'electron/pipeline-worker.js',
-  'electron/worker-path.js',
-  'electron/worker-bootstrap.js',
-  'electron/log-filter.js',
+const mustStayInAsar = ['app.jsc', 'loader-core.js', 'config.js', 'license-service.js'];
+const unpackPatterns = (builder.asarUnpack || []).join(' ');
+for (const file of mustStayInAsar) {
+  const base = path.basename(file);
+  if (unpackPatterns.includes(file) || unpackPatterns.includes(base)) {
+    errors.push(`不应 asarUnpack（会导致模块找不到）: ${file}`);
+  }
+}
+const requiredInPackage = [
   'loader-core.js',
   'app.jsc',
   'config.js',
   'license-service.js',
+  'electron/load-core.js',
 ];
-const unpackPatterns = (builder.asarUnpack || []).join(' ');
-for (const file of requiredUnpack) {
-  const covered = unpackPatterns.includes('electron/**/*')
-    || unpackPatterns.includes(file.replace(/\\/g, '/'))
-    || (file.startsWith('electron/') && unpackPatterns.includes('electron/**/*'));
-  if (!covered && !file.startsWith('electron/')) {
-    if (!unpackPatterns.includes(path.basename(file))) {
-      errors.push(`asarUnpack 可能未包含: ${file}`);
-    }
+const filesPatterns = (builder.files || []).join(' ');
+for (const file of requiredInPackage) {
+  const base = path.basename(file);
+  const dirGlob = file.includes('/') ? `${file.split('/')[0]}/**/*` : null;
+  const covered = filesPatterns.includes(file)
+    || filesPatterns.includes(base)
+    || (dirGlob && filesPatterns.includes(dirGlob));
+  if (!covered) {
+    errors.push(`electron-builder files 可能未包含: ${file}`);
   }
 }
 
