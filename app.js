@@ -340,15 +340,20 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function sortReplaceCommands(commands) {
+  return [...commands].sort((a, b) => b.search.length - a.search.length);
+}
+
 function processDirectory(dirPath, replaceCommands) {
+  const ordered = sortReplaceCommands(replaceCommands);
   for (const item of fs.readdirSync(dirPath)) {
     const itemPath = path.join(dirPath, item);
     if (fs.lstatSync(itemPath).isDirectory()) {
-      processDirectory(itemPath, replaceCommands);
+      processDirectory(itemPath, ordered);
     } else if (FILE_EXTENSIONS.TEXT.includes(path.extname(itemPath).toLowerCase())) {
       let content = fs.readFileSync(itemPath, 'utf8');
       let changed = false;
-      for (const cmd of replaceCommands) {
+      for (const cmd of ordered) {
         const escapedSearch = escapeRegExp(cmd.search);
         const newContent = content.replace(new RegExp(escapedSearch, 'g'), cmd.replace);
         if (newContent !== content) changed = true;
@@ -368,8 +373,9 @@ function applyReplaceCommands(dirPath, replaceCommands) {
     processDirectory(dirPath, withAt);
   }
   if (withoutAt.length) {
-    console.log(`Applying ${withoutAt.length} replace commands (without @) in ${path.basename(dirPath)}`);
-    processDirectory(dirPath, withoutAt);
+    const sorted = sortReplaceCommands(withoutAt);
+    console.log(`Applying ${sorted.length} replace commands (without @, longest-first) in ${path.basename(dirPath)}`);
+    processDirectory(dirPath, sorted);
   }
 }
 
@@ -563,7 +569,38 @@ async function migrateImportJson(subpackageDir, uuidAndExtra, renamedUUID, first
   removeEmptyDir(importSubDir);
 }
 
-function buildRenamePlan(uuidAndExtra, fileExt, originalFileName) {
+function buildBundlePathVariants(bundleRelPath, nativePathSearch, nativePathReplace) {
+  const variants = [];
+  const rel = bundleRelPath.replace(/\\/g, '/');
+  variants.push({
+    search: `${rel}/${nativePathSearch}`,
+    replace: `${rel}/${nativePathReplace}`,
+  });
+
+  const bundleName = path.basename(rel);
+  const parent = path.basename(path.dirname(rel));
+  if (parent === 'subpackages') {
+    variants.push({
+      search: `assets/${bundleName}/${nativePathSearch}`,
+      replace: `assets/${bundleName}/${nativePathReplace}`,
+    });
+  }
+  return variants;
+}
+
+function pushPathReplaceCommands(commands, search, replace) {
+  if (!search || search === replace) return;
+  commands.push({ search, replace, hasAt: false });
+  if (search.includes('/')) {
+    const bsSearch = search.replace(/\//g, '\\');
+    const bsReplace = replace.replace(/\//g, '\\');
+    if (bsSearch !== search) {
+      commands.push({ search: bsSearch, replace: bsReplace, hasAt: false });
+    }
+  }
+}
+
+function buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath) {
   let originalEncryptedName;
   let encryptedRenamedName;
   let renamedUUID;
@@ -594,6 +631,11 @@ function buildRenamePlan(uuidAndExtra, fileExt, originalFileName) {
 
   const origPrefix = uuidAndExtra.uuid.substring(0, 2);
   const newPrefix = renamedUUID.substring(0, 2);
+  const nativePathSearch = `native/${origPrefix}/${originalFileName}`;
+  const nativePathReplace = `native/${newPrefix}/${newFileName}`;
+  const bundlePathVariants = bundleRelPath
+    ? buildBundlePathVariants(bundleRelPath, nativePathSearch, nativePathReplace)
+    : [];
 
   return {
     renamedUUID,
@@ -603,18 +645,20 @@ function buildRenamePlan(uuidAndExtra, fileExt, originalFileName) {
     hasAt: uuidAndExtra.hasAt,
     plainUuidSearch: uuidAndExtra.uuid,
     plainUuidReplace: renamedUUID,
-    nativePathSearch: `native/${origPrefix}/${originalFileName}`,
-    nativePathReplace: `native/${newPrefix}/${newFileName}`,
+    nativePathSearch,
+    nativePathReplace,
+    bundlePathVariants,
   };
 }
 
 function pushReplaceCommands(commands, plan) {
+  for (const variant of plan.bundlePathVariants || []) {
+    pushPathReplaceCommands(commands, variant.search, variant.replace);
+  }
+  pushPathReplaceCommands(commands, plan.nativePathSearch, plan.nativePathReplace);
   commands.push({ search: plan.searchString, replace: plan.replaceString, hasAt: plan.hasAt });
   if (plan.plainUuidSearch && plan.plainUuidSearch !== plan.plainUuidReplace) {
     commands.push({ search: plan.plainUuidSearch, replace: plan.plainUuidReplace, hasAt: false });
-  }
-  if (plan.nativePathSearch && plan.nativePathSearch !== plan.nativePathReplace) {
-    commands.push({ search: plan.nativePathSearch, replace: plan.nativePathReplace, hasAt: false });
   }
 }
 
@@ -644,7 +688,10 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
     return;
   }
 
-  const plan = buildRenamePlan(uuidAndExtra, fileExt, file);
+  const bundleParent = path.basename(path.dirname(subpackageDir));
+  const bundleName = path.basename(subpackageDir);
+  const bundleRel = path.join(bundleParent, bundleName);
+  const plan = buildRenamePlan(uuidAndExtra, fileExt, file, bundleRel);
   const firstTwoChars = plan.renamedUUID.substring(0, 2);
   const newNativeSubDir = path.join(subpackageDir, 'native', firstTwoChars);
   await fs.mkdir(newNativeSubDir, { recursive: true });
@@ -663,8 +710,6 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
   await migrateImportJson(subpackageDir, uuidAndExtra, plan.renamedUUID, firstTwoChars);
 
   pushReplaceCommands(globalReplaceCommands, plan);
-  const bundleParent = path.basename(path.dirname(subpackageDir));
-  const bundleName = path.basename(subpackageDir);
   results.push({
     originalFile: file,
     newFileName: plan.newFileName,
@@ -705,6 +750,61 @@ async function recoverMissingNativeAssets(sourceDir, results) {
   return { recovered, missing };
 }
 
+function verifyPipelineResults(processedDir, results) {
+  let missingFiles = 0;
+  let staleRefs = 0;
+  const staleSamples = [];
+
+  for (const item of results) {
+    if (isValidOutputFile(item.newPath)) continue;
+    console.error(`[Verify] missing output: ${item.newPath}`);
+    missingFiles++;
+  }
+
+  function scanDir(dirPath) {
+    if (staleSamples.length >= 10) return;
+    for (const item of fs.readdirSync(dirPath)) {
+      const itemPath = path.join(dirPath, item);
+      if (fs.lstatSync(itemPath).isDirectory()) {
+        scanDir(itemPath);
+        if (staleSamples.length >= 10) return;
+        continue;
+      }
+      if (!FILE_EXTENSIONS.TEXT.includes(path.extname(itemPath).toLowerCase())) continue;
+
+      const content = fs.readFileSync(itemPath, 'utf8');
+      for (const result of results) {
+        const staleNativePath = `native/${result.uuid.substring(0, 2)}/${result.originalFile}`;
+        if (!content.includes(staleNativePath) && !content.includes(result.uuid)) continue;
+        staleRefs++;
+        staleSamples.push({
+          file: path.relative(processedDir, itemPath),
+          uuid: result.uuid,
+          staleNativePath,
+        });
+        if (staleSamples.length >= 10) return;
+      }
+    }
+  }
+
+  try {
+    scanDir(processedDir);
+  } catch (err) {
+    console.warn(`[Verify] scan failed: ${err.message}`);
+  }
+
+  if (staleSamples.length) {
+    console.error(`[Verify] stale native/uuid references (${staleRefs}+), samples:`);
+    for (const sample of staleSamples.slice(0, 5)) {
+      console.error(`  ${sample.file}: ${sample.staleNativePath}`);
+    }
+  }
+  if (missingFiles) {
+    console.error(`[Verify] ${missingFiles} missing native file(s)`);
+  }
+  return { missingFiles, staleRefs };
+}
+
 async function processSubpackage(subpackageDir, results, globalReplaceCommands) {
   const subpackageName = path.basename(subpackageDir);
   if (subpackageName.toLowerCase().includes('entryui')) {
@@ -714,9 +814,12 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
 
   const nativeDir = path.join(subpackageDir, 'native');
   const importDir = path.join(subpackageDir, 'import');
-  if (!fs.existsSync(nativeDir) || !fs.existsSync(importDir)) {
-    console.log(`Skip ${subpackageName}: missing native/import`);
+  if (!fs.existsSync(nativeDir)) {
+    console.log(`Skip ${subpackageName}: missing native`);
     return;
+  }
+  if (!fs.existsSync(importDir)) {
+    console.warn(`[Bundle] ${subpackageName}: no import dir, processing native only`);
   }
 
   console.log(`\n[Bundle] ${subpackageName}`);
@@ -961,6 +1064,7 @@ async function main(options = {}) {
 
   console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Applying global UUID replacements...`);
   applyReplaceCommands(processedDir, globalReplaceCommands);
+  verifyPipelineResults(processedDir, results);
 
   step(5, 'Obfuscating bundle JavaScript (parallel)...');
   await obfuscateAllBundles(subpackagesDir, assetsDir);

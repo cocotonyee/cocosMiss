@@ -120,7 +120,7 @@ const FILE_EXTENSIONS = {
   NATIVE: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin'],
   IMAGE: ['.png', '.jpeg', '.jpg'],
   AUDIO: ['.mp3', '.wav', '.aac', '.ogg', '.m4a'],
-  TEXT: ['.js', '.ts', '.json', '.html', '.css', '.xml', '.txt', '.md'],
+  TEXT: ['.js', '.ts', '.json', '.html', '.css', '.xml', '.txt', '.md', '.atlas', '.plist', '.map'],
   TOTAL: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin'],
 };
 
