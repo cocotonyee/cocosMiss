@@ -95,6 +95,20 @@ function buildObfuscationPresets(preferRatio, maxRatio) {
   ];
 }
 
+function buildLightObfuscationPreset(maxRatio = Infinity) {
+  return {
+    ...OBFUSCATION_BASE,
+    controlFlowFlattening: false,
+    stringArrayThreshold: 0.4,
+    maxRatio,
+    label: 'large-light',
+  };
+}
+
+const OBFUSCATION_LARGE_FILE_BYTES = 1024 * 1024;
+const OBFUSCATION_HUGE_FILE_BYTES = 2 * 1024 * 1024;
+
+// 兼容旧引用
 const OBFUSCATION_PRESETS = buildObfuscationPresets(OBFUSCATION_PREFER_RATIO, OBFUSCATION_MAX_RATIO);
 
 // 兼容旧引用
@@ -276,8 +290,11 @@ module.exports = {
   getWritableConfigPath,
   getObfuscationPresets,
   buildObfuscationPresets,
+  buildLightObfuscationPreset,
   deriveTierRatios,
   OBFUSCATION_TIER_GAP: DEFAULTS.OBFUSCATION_TIER_GAP,
+  OBFUSCATION_LARGE_FILE_BYTES,
+  OBFUSCATION_HUGE_FILE_BYTES,
   // 兼容旧代码直接解构（等于默认值，运行时请用 getFeatureFlags）
   CAN_OBFUSCATION: DEFAULTS.CAN_OBFUSCATION,
   CAN_IMAGE_SWITCH: DEFAULTS.CAN_IMAGE_SWITCH,

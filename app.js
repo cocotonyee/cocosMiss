@@ -2,41 +2,12 @@ const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
 const { exec, execSync } = require('child_process');
+const { Worker } = require('worker_threads');
 
 let _sharp;
 function getSharp() {
   if (!_sharp) _sharp = require('sharp');
   return _sharp;
-}
-
-let _JavaScriptObfuscator;
-function getObfuscator() {
-  if (!_JavaScriptObfuscator) {
-    const Module = require('module');
-    const obfPkgPath = require.resolve('javascript-obfuscator/package.json');
-    const obfDir = path.dirname(obfPkgPath);
-    const origResolve = Module._resolveFilename;
-
-    Module._resolveFilename = function patchedResolve(request, parent, isMain, options) {
-      if (request === 'ansi-styles' && parent?.filename?.includes(`${path.sep}chalk${path.sep}`)) {
-        const candidates = [
-          path.join(obfDir, 'node_modules', 'chalk', 'node_modules', 'ansi-styles', 'index.js'),
-          path.join(obfDir, 'node_modules', 'ansi-styles', 'index.js'),
-        ];
-        for (const candidate of candidates) {
-          if (fs.existsSync(candidate)) return candidate;
-        }
-      }
-      return origResolve.call(this, request, parent, isMain, options);
-    };
-
-    try {
-      _JavaScriptObfuscator = require('javascript-obfuscator');
-    } finally {
-      Module._resolveFilename = origResolve;
-    }
-  }
-  return _JavaScriptObfuscator;
 }
 
 const {
@@ -48,6 +19,8 @@ const {
   refreshFeatureFlags,
   applyFeatureFlags,
   getObfuscationPresets,
+  buildLightObfuscationPreset,
+  OBFUSCATION_LARGE_FILE_BYTES,
 } = require('./config');
 
 const {
@@ -638,9 +611,80 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
   console.log(`[Bundle] ${subpackageName} done (${tasks.length} assets)`);
 }
 
-// ─── JS 混淆（三档 + 体积保护）──────────────────────────────
+// ─── JS 混淆（三档 + 体积保护，Worker 线程）────────────────
 
-function obfuscateJavaScript(filePath) {
+const OBFUSCATION_WORKER_TIMEOUT_MS = 20 * 60 * 1000;
+
+function resolveObfuscateWorkerPath() {
+  const candidates = [
+    path.join(__dirname, 'obfuscate-worker.js'),
+    process.resourcesPath
+      ? path.join(process.resourcesPath, 'app.asar.unpacked', 'obfuscate-worker.js')
+      : null,
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(__dirname, 'obfuscate-worker.js');
+}
+
+function looksAlreadyObfuscated(code) {
+  if (code.length < 100 * 1024) return false;
+  const head = code.slice(0, 12000);
+  const hexVars = head.match(/_0x[0-9a-f]{4,6}/gi);
+  if (hexVars && hexVars.length >= 8) return true;
+  const newlineCount = (code.match(/\n/g) || []).length;
+  if (code.length > 800 * 1024 && newlineCount < 30) return true;
+  if (head.includes('stringArrayRotate') && head.includes('stringArray')) return true;
+  return false;
+}
+
+function pickObfuscationPresets(originalSize, code) {
+  if (looksAlreadyObfuscated(code)) {
+    return { skip: true, reason: 'already obfuscated' };
+  }
+  if (originalSize >= OBFUSCATION_LARGE_FILE_BYTES) {
+    const flags = getFeatureFlags();
+    return {
+      skip: false,
+      presets: [buildLightObfuscationPreset(flags.OBFUSCATION_MAX_RATIO)],
+      note: `large file (${(originalSize / 1024 / 1024).toFixed(2)}MB), light preset only`,
+    };
+  }
+  return { skip: false, presets: getObfuscationPresets() };
+}
+
+function obfuscateInWorker(code, options) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(resolveObfuscateWorkerPath());
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      worker.terminate().catch(() => {});
+      reject(new Error('Obfuscation timeout'));
+    }, OBFUSCATION_WORKER_TIMEOUT_MS);
+
+    worker.once('message', (msg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate().catch(() => {});
+      if (msg.ok) resolve(msg.result);
+      else reject(new Error(msg.error || 'Obfuscation failed'));
+    });
+    worker.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate().catch(() => {});
+      reject(err);
+    });
+    worker.postMessage({ code, options });
+  });
+}
+
+async function obfuscateJavaScript(filePath) {
   if (!fs.existsSync(filePath) || !getFeatureFlags().CAN_OBFUSCATION) return;
   if (isInWhitelist(filePath)) {
     console.log(`Skip obfuscation (whitelist): ${path.basename(filePath)}`);
@@ -650,36 +694,56 @@ function obfuscateJavaScript(filePath) {
   const original = fs.readFileSync(filePath, 'utf8');
   const originalSize = original.length;
 
-  // 极小文件混淆体积膨胀无意义，跳过
   if (originalSize < 8192) {
     console.log(`Skip obfuscation (too small): ${path.basename(filePath)} (${originalSize}B)`);
     return;
+  }
+
+  const plan = pickObfuscationPresets(originalSize, original);
+  if (plan.skip) {
+    console.log(
+      `Skip obfuscation (${plan.reason}): ${path.basename(filePath)} (${(originalSize / 1024 / 1024).toFixed(2)}MB)`,
+    );
+    return;
+  }
+  if (plan.note) console.log(`${plan.note}: ${path.basename(filePath)}`);
+
+  const baseName = path.basename(filePath);
+  let heartbeat = null;
+  if (originalSize >= OBFUSCATION_LARGE_FILE_BYTES) {
+    heartbeat = setInterval(() => {
+      console.log(`  still obfuscating ${baseName}...`);
+    }, 15000);
   }
 
   let bestCode = null;
   let bestRatio = Infinity;
   let bestLabel = '';
 
-  for (const preset of getObfuscationPresets()) {
-    const { maxRatio, label, ...options } = preset;
-    const seed = crypto.randomInt(0, 1000000);
-    try {
-      const result = getObfuscator().obfuscate(original, { ...options, seed }).getObfuscatedCode();
-      const ratio = result.length / originalSize;
-      if (ratio <= maxRatio) {
-        bestCode = result;
-        bestRatio = ratio;
-        bestLabel = label;
-        break;
+  try {
+    for (const preset of plan.presets) {
+      const { maxRatio, label, ...options } = preset;
+      const seed = crypto.randomInt(0, 1000000);
+      try {
+        const result = await obfuscateInWorker(original, { ...options, seed });
+        const ratio = result.length / originalSize;
+        if (ratio <= maxRatio) {
+          bestCode = result;
+          bestRatio = ratio;
+          bestLabel = label;
+          break;
+        }
+        if (ratio < bestRatio) {
+          bestCode = result;
+          bestRatio = ratio;
+          bestLabel = label;
+        }
+      } catch (err) {
+        console.warn(`Obfuscate ${label} failed for ${baseName}: ${err.message}`);
       }
-      if (ratio < bestRatio) {
-        bestCode = result;
-        bestRatio = ratio;
-        bestLabel = label;
-      }
-    } catch (err) {
-      console.warn(`Obfuscate ${label} failed for ${path.basename(filePath)}: ${err.message}`);
     }
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
   }
 
   if (!bestCode) {
@@ -689,17 +753,17 @@ function obfuscateJavaScript(filePath) {
 
   fs.writeFileSync(filePath, bestCode, 'utf8');
   console.log(
-    `Obfuscated ${path.basename(filePath)} [${bestLabel}]: ${(originalSize / 1024).toFixed(1)}KB → ${(bestCode.length / 1024).toFixed(1)}KB (${bestRatio.toFixed(2)}x)`
+    `Obfuscated ${baseName} [${bestLabel}]: ${(originalSize / 1024).toFixed(1)}KB → ${(bestCode.length / 1024).toFixed(1)}KB (${bestRatio.toFixed(2)}x)`,
   );
 }
 
 async function obfuscateBundleJs(bundlePath, type) {
   if (type === 'subpackage') {
     const gameJsPath = path.join(bundlePath, 'game.js');
-    if (fs.existsSync(gameJsPath)) obfuscateJavaScript(gameJsPath);
+    if (fs.existsSync(gameJsPath)) await obfuscateJavaScript(gameJsPath);
   } else {
     const indexJsFile = fs.readdirSync(bundlePath).find((f) => /index(\..*)?\.js$/.test(f));
-    if (indexJsFile) obfuscateJavaScript(path.join(bundlePath, indexJsFile));
+    if (indexJsFile) await obfuscateJavaScript(path.join(bundlePath, indexJsFile));
   }
 }
 

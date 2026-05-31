@@ -21,6 +21,8 @@
     "app.jsc",
     "config.js",
     "license-service.js",
+    "obfuscator-loader.js",
+    "obfuscate-worker.js",
     "electron/**/*",
     "node_modules/**/*",
     "package.json"
@@ -30,6 +32,8 @@
     "node_modules/sharp/**/*",
     "node_modules/@img/**/*",
     "node_modules/bytenode/**/*",
+    "obfuscate-worker.js",
+    "obfuscator-loader.js",
     "electron/**/*"
   ],
   "extraResources": [
