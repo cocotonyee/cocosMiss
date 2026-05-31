@@ -117,11 +117,11 @@ const OBFUSCATION_CONFIG = OBFUSCATION_BASE;
 
 // 文件扩展名
 const FILE_EXTENSIONS = {
-  NATIVE: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin'],
+  NATIVE: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin', '.ttf', '.font'],
   IMAGE: ['.png', '.jpeg', '.jpg'],
   AUDIO: ['.mp3', '.wav', '.aac', '.ogg', '.m4a'],
   TEXT: ['.js', '.ts', '.json', '.html', '.css', '.xml', '.txt', '.md', '.atlas', '.plist', '.map'],
-  TOTAL: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin'],
+  TOTAL: ['.png', '.jpeg', '.jpg', '.mp3', '.wav', '.aac', '.ogg', '.m4a', '.atlas', '.plist', '.bin', '.ttf', '.font'],
 };
 
 const USER_CONFIG_NAME = 'milfun.config.json';
