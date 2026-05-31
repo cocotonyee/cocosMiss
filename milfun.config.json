@@ -1,5 +1,7 @@
 {
   "canObfuscation": true,
   "canImageSwitch": true,
-  "canAudioSwitch": true
+  "canAudioSwitch": true,
+  "obfuscationPreferRatio": 1.3,
+  "obfuscationMaxRatio": 1.6
 }

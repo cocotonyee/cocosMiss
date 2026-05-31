@@ -3,15 +3,20 @@ const fs = require('fs');
 const path = require('path');
 
 // 内置默认值（客户可通过 milfun.config.json 覆盖）
+const OBFUSCATION_TIER_GAP = 0.3;
+
 const DEFAULTS = {
   CAN_OBFUSCATION: true,
   CAN_IMAGE_SWITCH: true,
   CAN_AUDIO_SWITCH: true,
+  OBFUSCATION_PREFER_RATIO: 1.5,
+  OBFUSCATION_MAX_RATIO: 1.8,
+  OBFUSCATION_TIER_GAP,
 };
 
-// 混淆体积上限
-const OBFUSCATION_PREFER_RATIO = 1.5;
-const OBFUSCATION_MAX_RATIO = 1.8;
+// 内置默认（兼容旧导出）
+const OBFUSCATION_PREFER_RATIO = DEFAULTS.OBFUSCATION_PREFER_RATIO;
+const OBFUSCATION_MAX_RATIO = DEFAULTS.OBFUSCATION_MAX_RATIO;
 
 // 目录配置
 const DIR_CONFIG = {
@@ -63,30 +68,34 @@ const OBFUSCATION_BASE = {
   ccSignalString: 'paloma',
 };
 
-// 三档混淆 preset（体积优先 → 效果加强 → 保底）
-const OBFUSCATION_PRESETS = [
-  {
-    ...OBFUSCATION_BASE,
-    controlFlowFlatteningThreshold: 0.35,
-    stringArrayThreshold: 0.55,
-    maxRatio: OBFUSCATION_PREFER_RATIO,
-    label: 'tier1',
-  },
-  {
-    ...OBFUSCATION_BASE,
-    controlFlowFlatteningThreshold: 0.45,
-    stringArrayThreshold: 0.65,
-    maxRatio: OBFUSCATION_MAX_RATIO,
-    label: 'tier2',
-  },
-  {
-    ...OBFUSCATION_BASE,
-    controlFlowFlatteningThreshold: 0.2,
-    stringArrayThreshold: 0.4,
-    maxRatio: Infinity,
-    label: 'tier3',
-  },
-];
+// 三档混淆 preset 模板（maxRatio 运行时由 getObfuscationPresets 注入）
+function buildObfuscationPresets(preferRatio, maxRatio) {
+  return [
+    {
+      ...OBFUSCATION_BASE,
+      controlFlowFlatteningThreshold: 0.35,
+      stringArrayThreshold: 0.55,
+      maxRatio: preferRatio,
+      label: 'tier1',
+    },
+    {
+      ...OBFUSCATION_BASE,
+      controlFlowFlatteningThreshold: 0.45,
+      stringArrayThreshold: 0.65,
+      maxRatio: maxRatio,
+      label: 'tier2',
+    },
+    {
+      ...OBFUSCATION_BASE,
+      controlFlowFlatteningThreshold: 0.2,
+      stringArrayThreshold: 0.4,
+      maxRatio: Infinity,
+      label: 'tier3',
+    },
+  ];
+}
+
+const OBFUSCATION_PRESETS = buildObfuscationPresets(OBFUSCATION_PREFER_RATIO, OBFUSCATION_MAX_RATIO);
 
 // 兼容旧引用
 const OBFUSCATION_CONFIG = OBFUSCATION_BASE;
@@ -136,14 +145,54 @@ function pickBool(data, camelKey, upperKey, fallback) {
   return fallback;
 }
 
+function pickRatio(data, camelKey, upperKey, fallback) {
+  const raw = data[camelKey] ?? data[upperKey];
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, 5);
+}
+
+function deriveTierRatios(maxRatio) {
+  const max = pickRatio({ v: maxRatio }, 'v', 'v', DEFAULTS.OBFUSCATION_MAX_RATIO);
+  const prefer = Math.max(1, Math.round((max - DEFAULTS.OBFUSCATION_TIER_GAP) * 10) / 10);
+  return { preferRatio: Math.min(prefer, max), maxRatio: max };
+}
+
+function normalizeRatios(prefer, max) {
+  const maxRatio = pickRatio({ v: max }, 'v', 'v', DEFAULTS.OBFUSCATION_MAX_RATIO);
+  if (prefer === undefined || prefer === null || prefer === '') {
+    return deriveTierRatios(maxRatio);
+  }
+  let preferRatio = Number(prefer);
+  let normalizedMax = Number(maxRatio);
+  if (!Number.isFinite(preferRatio) || preferRatio < 1) preferRatio = DEFAULTS.OBFUSCATION_PREFER_RATIO;
+  if (!Number.isFinite(normalizedMax) || normalizedMax < 1) normalizedMax = DEFAULTS.OBFUSCATION_MAX_RATIO;
+  preferRatio = Math.min(preferRatio, 5);
+  normalizedMax = Math.min(normalizedMax, 5);
+  if (normalizedMax < preferRatio) normalizedMax = preferRatio;
+  return { preferRatio, maxRatio: normalizedMax };
+}
+
+function readConfigDataOrEmpty() {
+  const loaded = readUserConfigFile();
+  return loaded?.data && typeof loaded.data === 'object' ? { ...loaded.data } : {};
+}
+
 let _featureFlags = null;
 
 function refreshFeatureFlags() {
   const loaded = readUserConfigFile();
+  const data = loaded?.data || {};
+  const { preferRatio, maxRatio } = normalizeRatios(
+    pickRatio(data, 'obfuscationPreferRatio', 'OBFUSCATION_PREFER_RATIO', DEFAULTS.OBFUSCATION_PREFER_RATIO),
+    pickRatio(data, 'obfuscationMaxRatio', 'OBFUSCATION_MAX_RATIO', DEFAULTS.OBFUSCATION_MAX_RATIO),
+  );
   _featureFlags = {
-    CAN_OBFUSCATION: pickBool(loaded?.data || {}, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
-    CAN_IMAGE_SWITCH: pickBool(loaded?.data || {}, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
-    CAN_AUDIO_SWITCH: pickBool(loaded?.data || {}, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
+    CAN_OBFUSCATION: pickBool(data, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
+    CAN_IMAGE_SWITCH: pickBool(data, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
+    CAN_AUDIO_SWITCH: pickBool(data, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
+    OBFUSCATION_PREFER_RATIO: preferRatio,
+    OBFUSCATION_MAX_RATIO: maxRatio,
     configPath: loaded?.configPath || null,
   };
   return _featureFlags;
@@ -156,21 +205,33 @@ function getFeatureFlags() {
 
 function applyFeatureFlags(overrides) {
   if (!overrides) return refreshFeatureFlags();
+  const { preferRatio, maxRatio } = normalizeRatios(
+    overrides.obfuscationPreferRatio ?? overrides.OBFUSCATION_PREFER_RATIO,
+    overrides.obfuscationMaxRatio ?? overrides.OBFUSCATION_MAX_RATIO,
+  );
   _featureFlags = {
     CAN_OBFUSCATION: pickBool(overrides, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
     CAN_IMAGE_SWITCH: pickBool(overrides, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
     CAN_AUDIO_SWITCH: pickBool(overrides, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
+    OBFUSCATION_PREFER_RATIO: preferRatio,
+    OBFUSCATION_MAX_RATIO: maxRatio,
     configPath: getWritableConfigPath(),
   };
   return _featureFlags;
 }
 
 function saveFeatureFlags(flags) {
-  const data = {
-    canObfuscation: pickBool(flags, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
-    canImageSwitch: pickBool(flags, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
-    canAudioSwitch: pickBool(flags, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
-  };
+  const maxInput = flags.obfuscationMaxRatio ?? flags.OBFUSCATION_MAX_RATIO;
+  const preferInput = flags.obfuscationPreferRatio ?? flags.OBFUSCATION_PREFER_RATIO;
+  const { preferRatio, maxRatio } = preferInput === undefined || preferInput === null
+    ? deriveTierRatios(maxInput)
+    : normalizeRatios(preferInput, maxInput);
+  const data = readConfigDataOrEmpty();
+  data.canObfuscation = pickBool(flags, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION);
+  data.canImageSwitch = pickBool(flags, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH);
+  data.canAudioSwitch = pickBool(flags, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH);
+  data.obfuscationPreferRatio = preferRatio;
+  data.obfuscationMaxRatio = maxRatio;
   const configPath = getWritableConfigPath();
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   fs.writeFileSync(configPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
@@ -183,8 +244,16 @@ function getFeatureConfigForUi() {
     canObfuscation: flags.CAN_OBFUSCATION,
     canImageSwitch: flags.CAN_IMAGE_SWITCH,
     canAudioSwitch: flags.CAN_AUDIO_SWITCH,
+    obfuscationMaxRatio: flags.OBFUSCATION_MAX_RATIO,
+    obfuscationPreferRatio: flags.OBFUSCATION_PREFER_RATIO,
+    obfuscationTierGap: DEFAULTS.OBFUSCATION_TIER_GAP,
     configPath: flags.configPath || getWritableConfigPath(),
   };
+}
+
+function getObfuscationPresets() {
+  const flags = getFeatureFlags();
+  return buildObfuscationPresets(flags.OBFUSCATION_PREFER_RATIO, flags.OBFUSCATION_MAX_RATIO);
 }
 
 refreshFeatureFlags();
@@ -205,6 +274,10 @@ module.exports = {
   saveFeatureFlags,
   getFeatureConfigForUi,
   getWritableConfigPath,
+  getObfuscationPresets,
+  buildObfuscationPresets,
+  deriveTierRatios,
+  OBFUSCATION_TIER_GAP: DEFAULTS.OBFUSCATION_TIER_GAP,
   // 兼容旧代码直接解构（等于默认值，运行时请用 getFeatureFlags）
   CAN_OBFUSCATION: DEFAULTS.CAN_OBFUSCATION,
   CAN_IMAGE_SWITCH: DEFAULTS.CAN_IMAGE_SWITCH,

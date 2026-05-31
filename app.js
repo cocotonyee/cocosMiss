@@ -43,11 +43,11 @@ const {
   DIR_CONFIG,
   FILE_EXTENSIONS,
   OBFUSCATION_CONFIG,
-  OBFUSCATION_PRESETS,
   WHITELIST_CONFIG,
   getFeatureFlags,
   refreshFeatureFlags,
   applyFeatureFlags,
+  getObfuscationPresets,
 } = require('./config');
 
 const {
@@ -583,7 +583,7 @@ function obfuscateJavaScript(filePath) {
   let bestRatio = Infinity;
   let bestLabel = '';
 
-  for (const preset of OBFUSCATION_PRESETS) {
+  for (const preset of getObfuscationPresets()) {
     const { maxRatio, label, ...options } = preset;
     const seed = crypto.randomInt(0, 1000000);
     try {
@@ -715,13 +715,13 @@ async function runPipeline(options = {}) {
     if (options.featureFlags) {
       applyFeatureFlags(options.featureFlags);
       console.log(
-        `[Config] 界面开关: 混淆=${options.featureFlags.canObfuscation} 图片=${options.featureFlags.canImageSwitch} 音频=${options.featureFlags.canAudioSwitch}`,
+        `[Config] 界面开关: 混淆=${options.featureFlags.canObfuscation} 图片=${options.featureFlags.canImageSwitch} 音频=${options.featureFlags.canAudioSwitch} tier1≤${options.featureFlags.obfuscationPreferRatio} tier2≤${options.featureFlags.obfuscationMaxRatio}`,
       );
     } else {
       const flags = refreshFeatureFlags();
       if (flags.configPath) {
         console.log(`[Config] 已加载: ${flags.configPath}`);
-        console.log(`[Config] 混淆=${flags.CAN_OBFUSCATION} 图片=${flags.CAN_IMAGE_SWITCH} 音频=${flags.CAN_AUDIO_SWITCH}`);
+        console.log(`[Config] 混淆=${flags.CAN_OBFUSCATION} 图片=${flags.CAN_IMAGE_SWITCH} 音频=${flags.CAN_AUDIO_SWITCH} tier1≤${flags.OBFUSCATION_PREFER_RATIO} tier2≤${flags.OBFUSCATION_MAX_RATIO}`);
       } else {
         console.log('[Config] 未找到 milfun.config.json，使用默认开关');
       }

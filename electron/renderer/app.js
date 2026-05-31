@@ -7,7 +7,12 @@ const settingsPopover = document.getElementById('settings-popover');
 const btnImportLicense = document.getElementById('btn-import-license');
 const btnFingerprint = document.getElementById('btn-fingerprint');
 const btnStart = document.getElementById('btn-start');
+const btnOpenOutput = document.getElementById('btn-open-output');
 const cfgObfuscation = document.getElementById('cfg-obfuscation');
+const cfgObfRatio = document.getElementById('cfg-obf-ratio');
+const cfgObfRatioVal = document.getElementById('cfg-obf-ratio-val');
+const cfgObfRatioHint = document.getElementById('cfg-obf-ratio-hint');
+const obfRatioRows = document.getElementById('obf-ratio-rows');
 const cfgImage = document.getElementById('cfg-image');
 const cfgAudio = document.getElementById('cfg-audio');
 const logOutput = document.getElementById('log-output');
@@ -15,6 +20,8 @@ const progressFill = document.getElementById('progress-fill');
 const progressPercent = document.getElementById('progress-percent');
 const setupOverlay = document.getElementById('setup-overlay');
 const setupLog = document.getElementById('setup-log');
+
+const OBF_TIER_GAP = 0.3;
 
 let sourcePath = '';
 let processedDir = '';
@@ -71,11 +78,42 @@ function setLicenseBadge(result) {
   }
 }
 
+function clampRatio(value, fallback = 1.8) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, 5);
+}
+
+function ratioToSlider(ratio) {
+  return Math.round(clampRatio(ratio) * 10);
+}
+
+function sliderToRatio(slider) {
+  return clampRatio(Number(slider) / 10);
+}
+
+function deriveTierRatios(maxRatio) {
+  const max = clampRatio(maxRatio);
+  const prefer = Math.max(1, Math.round((max - OBF_TIER_GAP) * 10) / 10);
+  return { preferRatio: Math.min(prefer, max), maxRatio: max };
+}
+
+function syncObfRatioUi() {
+  const { preferRatio, maxRatio } = deriveTierRatios(sliderToRatio(cfgObfRatio.value));
+  cfgObfRatio.value = String(ratioToSlider(maxRatio));
+  cfgObfRatioVal.textContent = maxRatio.toFixed(1);
+  cfgObfRatioHint.textContent = `tier1 ≤ ${preferRatio.toFixed(1)} · tier2 ≤ ${maxRatio.toFixed(1)}`;
+  return { preferRatio, maxRatio };
+}
+
 function getFeatureFlagsFromUi() {
+  const { preferRatio, maxRatio } = syncObfRatioUi();
   return {
     canObfuscation: cfgObfuscation.checked,
     canImageSwitch: cfgImage.checked,
     canAudioSwitch: cfgAudio.checked,
+    obfuscationMaxRatio: maxRatio,
+    obfuscationPreferRatio: preferRatio,
   };
 }
 
@@ -83,12 +121,22 @@ function applyFeatureFlagsToUi(flags) {
   cfgObfuscation.checked = Boolean(flags.canObfuscation);
   cfgImage.checked = Boolean(flags.canImageSwitch);
   cfgAudio.checked = Boolean(flags.canAudioSwitch);
+  cfgObfRatio.value = String(ratioToSlider(flags.obfuscationMaxRatio ?? 1.8));
+  syncObfRatioUi();
+  updateObfRatioState();
+}
+
+function updateObfRatioState() {
+  const on = cfgObfuscation.checked && !cfgObfuscation.disabled;
+  obfRatioRows.classList.toggle('disabled', !on);
+  cfgObfRatio.disabled = !on;
 }
 
 function setFeatureControlsDisabled(disabled) {
   cfgObfuscation.disabled = disabled;
   cfgImage.disabled = disabled;
   cfgAudio.disabled = disabled;
+  updateObfRatioState();
 }
 
 async function loadFeatureConfig() {
@@ -144,6 +192,7 @@ function bindEvents() {
   window.milfun.onProcessingState(({ running }) => {
     isProcessing = running;
     btnStart.disabled = running || !licenseValid || !appReady;
+    btnOpenOutput.disabled = running || !appReady;
     btnBrowse.disabled = running;
     btnSettings.disabled = running;
     btnFingerprint.disabled = running;
@@ -163,10 +212,20 @@ function bindEvents() {
     setProgress(0, 5);
   });
 
-  [cfgObfuscation, cfgImage, cfgAudio].forEach((input) => {
+  cfgObfuscation.addEventListener('change', () => {
+    updateObfRatioState();
+    if (!isProcessing) scheduleSaveFeatureConfig();
+  });
+
+  [cfgImage, cfgAudio].forEach((input) => {
     input.addEventListener('change', () => {
       if (!isProcessing) scheduleSaveFeatureConfig();
     });
+  });
+
+  cfgObfRatio.addEventListener('input', () => {
+    syncObfRatioUi();
+    if (!isProcessing) scheduleSaveFeatureConfig();
   });
 
   document.addEventListener('click', (e) => {
@@ -222,6 +281,12 @@ function bindEvents() {
       setProgress(0, 5);
     }
   });
+
+  btnOpenOutput.addEventListener('click', async () => {
+    const dir = processedDir || (await window.milfun.getAppInfo()).processedDir;
+    const ok = await window.milfun.openPath(dir);
+    if (!ok) appendLog('warn', '输出目录尚不存在，请先处理一次');
+  });
 }
 
 async function initApp() {
@@ -230,6 +295,7 @@ async function initApp() {
   sourcePath = info.defaultSource;
   sourceDisplay.textContent = shortPath(sourcePath);
   appReady = info.depsReady;
+  btnOpenOutput.disabled = !appReady;
   await loadFeatureConfig();
   await refreshLicense();
 }
