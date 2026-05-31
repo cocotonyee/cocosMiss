@@ -1220,56 +1220,117 @@ function decodeCocosEncodedUuid(base64) {
   return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20, 32)}`;
 }
 
-function collectPackEncodedUuids(content) {
-  const hits = [];
+const STANDARD_UUID_REGEX = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+
+function isValidEncodedCocosUuid(s) {
+  if (typeof s !== 'string' || s.length !== 22 || !/^[A-Za-z0-9+/=]+$/.test(s)) return false;
+  try {
+    const decoded = decodeCocosEncodedUuid(s);
+    if (!decoded || !STANDARD_UUID_REGEX.test(decoded)) return false;
+    return encode(decoded.replace(/-/g, '')) === s;
+  } catch {
+    return false;
+  }
+}
+
+function collectPackAssetRefs(content) {
+  const refs = [];
   try {
     const parsed = JSON.parse(content);
-    if (!Array.isArray(parsed) || !Array.isArray(parsed[1])) return hits;
+    if (!Array.isArray(parsed) || !Array.isArray(parsed[1])) return refs;
     for (const item of parsed[1]) {
-      if (typeof item === 'string' && item.length >= 20) hits.push(item);
+      if (typeof item !== 'string') continue;
+      if (isValidEncodedCocosUuid(item)) {
+        refs.push({ uuid: decodeCocosEncodedUuid(item), suffix: '' });
+        continue;
+      }
+      const atIdx = item.indexOf('@');
+      if (atIdx > 0) {
+        const base = item.slice(0, atIdx);
+        const suffix = item.slice(atIdx);
+        if (isValidEncodedCocosUuid(base)) {
+          refs.push({ uuid: decodeCocosEncodedUuid(base), suffix });
+        }
+      }
     }
   } catch {
     // ignore non-json import files
   }
-  return hits;
+  return refs;
+}
+
+function collectPackEncodedUuids(content) {
+  return collectPackAssetRefs(content).map((ref) => ref.uuid).filter(Boolean);
+}
+
+function buildUuidResolveMap(results, uuidRegistry) {
+  const resolved = new Map();
+  if (uuidRegistry) {
+    for (const [orig, entry] of uuidRegistry.entries()) {
+      resolved.set(orig, entry.renamedUUID);
+    }
+  }
+  for (const item of results) {
+    if (item.uuid && item.renamedUUID) resolved.set(item.uuid, item.renamedUUID);
+    if (item.renamedUUID) resolved.set(item.renamedUUID, item.renamedUUID);
+  }
+  return resolved;
+}
+
+function uuidExistsInImportIndex(uuid, suffix, index, resolveMap) {
+  const mapped = resolveMap.get(uuid) || uuid;
+  const keys = suffix
+    ? [`${mapped}${suffix}`, `${uuid}${suffix}`, mapped, uuid]
+    : [mapped, uuid];
+  for (const key of keys) {
+    if (index.has(key)) return true;
+  }
+  return false;
 }
 
 function buildImportUuidIndex(processedDir) {
   const index = new Map();
-  const assetsRoot = path.join(processedDir, 'assets');
-  if (!fs.existsSync(assetsRoot)) return index;
+  const scanRoots = ['assets', 'subpackages']
+    .map((name) => path.join(processedDir, name))
+    .filter((dirPath) => fs.existsSync(dirPath));
 
-  for (const bundleName of fs.readdirSync(assetsRoot)) {
-    const importRoot = path.join(assetsRoot, bundleName, 'import');
-    if (!fs.existsSync(importRoot)) continue;
-    const bundleDir = path.join(assetsRoot, bundleName);
+  for (const assetsRoot of scanRoots) {
+    for (const bundleName of fs.readdirSync(assetsRoot)) {
+      const bundleDir = path.join(assetsRoot, bundleName);
+      if (!fs.lstatSync(bundleDir).isDirectory()) continue;
+      const importRoot = path.join(bundleDir, 'import');
+      if (!fs.existsSync(importRoot)) continue;
 
-    const walk = (dirPath) => {
-      for (const entry of fs.readdirSync(dirPath)) {
-        const entryPath = path.join(dirPath, entry);
-        if (fs.lstatSync(entryPath).isDirectory()) {
-          walk(entryPath);
-          continue;
+      const walk = (dirPath) => {
+        for (const entry of fs.readdirSync(dirPath)) {
+          const entryPath = path.join(dirPath, entry);
+          if (fs.lstatSync(entryPath).isDirectory()) {
+            walk(entryPath);
+            continue;
+          }
+          if (!entry.endsWith('.json')) continue;
+          const parsed = extractUUIDAndExtra(path.basename(entry, '.json'));
+          if (!parsed || parsed.notUUid) continue;
+          if (!isValidOutputFile(entryPath)) continue;
+
+          const meta = { importPath: entryPath, bundleDir, baseUuid: parsed.uuid };
+          const variantKey = parsed.hasAt ? `${parsed.uuid}${parsed.afterAt}` : parsed.uuid;
+          if (!index.has(variantKey)) index.set(variantKey, meta);
+          if (!index.has(parsed.uuid)) index.set(parsed.uuid, meta);
         }
-        if (!entry.endsWith('.json')) continue;
-        const parsed = extractUUIDAndExtra(path.basename(entry, '.json'));
-        if (!parsed || parsed.notUUid || parsed.hasAt) continue;
-        if (!isValidOutputFile(entryPath)) continue;
-        if (!index.has(parsed.uuid)) {
-          index.set(parsed.uuid, { importPath: entryPath, bundleDir });
-        }
-      }
-    };
-    walk(importRoot);
+      };
+      walk(importRoot);
+    }
   }
   return index;
 }
 
-function verifyBundlePackImportRefs(processedDir, importIndex) {
+function verifyBundlePackImportRefs(processedDir, importIndex, resolveMap) {
   const assetsRoot = path.join(processedDir, 'assets');
   if (!fs.existsSync(assetsRoot)) return { missingPackImports: 0, samples: [] };
 
   const index = importIndex || buildImportUuidIndex(processedDir);
+  const resolved = resolveMap || new Map();
   const samples = [];
   let missingPackImports = 0;
 
@@ -1286,15 +1347,15 @@ function verifyBundlePackImportRefs(processedDir, importIndex) {
         }
         if (!entry.endsWith('.json')) continue;
         const content = fs.readFileSync(entryPath, 'utf8');
-        for (const encoded of collectPackEncodedUuids(content)) {
-          const uuid = decodeCocosEncodedUuid(encoded);
-          if (!uuid || index.has(uuid)) continue;
+        for (const ref of collectPackAssetRefs(content)) {
+          if (!ref.uuid || uuidExistsInImportIndex(ref.uuid, ref.suffix, index, resolved)) continue;
           missingPackImports++;
           if (samples.length < 10) {
             samples.push({
               bundle: bundleName,
               pack: path.relative(importRoot, entryPath),
-              uuid,
+              uuid: ref.uuid,
+              suffix: ref.suffix || '',
             });
           }
         }
@@ -1306,7 +1367,7 @@ function verifyBundlePackImportRefs(processedDir, importIndex) {
   if (samples.length) {
     console.error(`[Verify] ${missingPackImports} pack ref(s) point to missing import UUID(s), samples:`);
     for (const sample of samples.slice(0, 5)) {
-      console.error(`  ${sample.bundle}/${sample.pack} → uuid ${sample.uuid}`);
+      console.error(`  ${sample.bundle}/${sample.pack} → uuid ${sample.uuid}${sample.suffix}`);
     }
   }
   return { missingPackImports, samples };
@@ -1416,10 +1477,8 @@ function verifyPipelineResults(processedDir, results, options = {}) {
   }
 
   const importIndex = options.importIndex || buildImportUuidIndex(processedDir);
-  const packImportVerify = verifyBundlePackImportRefs(processedDir, importIndex);
-  if (packImportVerify.missingPackImports) {
-    missingFiles += packImportVerify.missingPackImports;
-  }
+  const resolveMap = buildUuidResolveMap(results, options.uuidRegistry);
+  const packImportVerify = verifyBundlePackImportRefs(processedDir, importIndex, resolveMap);
 
   const staleRefs = staleByUuid.size;
   if (staleSamples.length) {
@@ -1429,7 +1488,10 @@ function verifyPipelineResults(processedDir, results, options = {}) {
     }
   }
   if (missingFiles) {
-    console.error(`[Verify] ${missingFiles} missing native file(s)`);
+    console.error(`[Verify] ${missingFiles} missing output file(s)`);
+  }
+  if (packImportVerify.missingPackImports) {
+    console.error(`[Verify] ${packImportVerify.missingPackImports} unresolved pack import ref(s)`);
   }
   return { missingFiles, staleRefs, staleByUuid, staleSamples, packImportVerify };
 }
@@ -1558,7 +1620,7 @@ function writePipelineAuditReport(appRoot, processedDir, results, verifyResult, 
     staleReferenceCount: verifyResult.staleRefs,
     staleUuids: staleUuids.slice(0, 50),
     ...extra,
-    hint: verifyResult.staleRefs || verifyResult.missingFiles
+    hint: verifyResult.staleRefs || verifyResult.missingFiles || verifyResult.packImportVerify?.missingPackImports
       ? '请用 src_processed 运行游戏；在 src_processed 内搜索 staleUuids 应无结果'
       : '校验通过，请使用 src_processed 目录作为构建产物运行',
   };
@@ -1856,21 +1918,24 @@ async function main(options = {}) {
   console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Applying global UUID replacements...`);
   await applyReplaceCommands(processedDir, globalReplaceCommands, { label: 'initial', onProgress });
   let importIndex = buildImportUuidIndex(processedDir);
-  let verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+  const verifyOpts = { importIndex, uuidRegistry: sharedUuidState.uuidRegistry };
+  let verifyResult = verifyPipelineResults(processedDir, results, verifyOpts);
   if (verifyResult.staleRefs > 0) {
     console.warn('[Repair] stale references detected, retrying global replace...');
     await applyReplaceCommands(processedDir, globalReplaceCommands, { label: 'stale-retry', onProgress });
     importIndex = buildImportUuidIndex(processedDir);
-    verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+    verifyOpts.importIndex = importIndex;
+    verifyResult = verifyPipelineResults(processedDir, results, verifyOpts);
   }
 
   let cleanupResult = { removed: 0, freedBytes: 0 };
-  if (!verifyResult.staleRefs && !verifyResult.missingFiles) {
+  if (!verifyResult.staleRefs && !verifyResult.missingFiles && !verifyResult.packImportVerify?.missingPackImports) {
     cleanupResult = await cleanupLegacyDuplicates(results);
     if (cleanupResult.removed) {
       pruneBundleAssetDirs(processedDir);
       importIndex = buildImportUuidIndex(processedDir);
-      verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+      verifyOpts.importIndex = importIndex;
+      verifyResult = verifyPipelineResults(processedDir, results, verifyOpts);
       console.log(`[Cleanup] removed ${cleanupResult.removed} leftover duplicate(s), verify stale=${verifyResult.staleRefs}`);
     }
   }
@@ -1896,14 +1961,16 @@ async function main(options = {}) {
       onProgress,
     });
     importIndex = buildImportUuidIndex(processedDir);
-    verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+    verifyOpts.importIndex = importIndex;
+    verifyResult = verifyPipelineResults(processedDir, results, verifyOpts);
     writePipelineAuditReport(appRoot, processedDir, results, verifyResult, { fileCount: fileCountVerify });
   }
 
   console.log(`\nSummary: ${results.length} assets processed, ${globalReplaceCommands.length} replacements`);
-  if (verifyResult.staleRefs || verifyResult.missingFiles || !fileCountVerify.ok) {
+  const packMissing = verifyResult.packImportVerify?.missingPackImports || 0;
+  if (verifyResult.staleRefs || verifyResult.missingFiles || packMissing || !fileCountVerify.ok) {
     console.error(
-      `[Summary] verify FAILED: stale=${verifyResult.staleRefs} missing=${verifyResult.missingFiles} fileCount=${fileCountVerify.ok ? 'OK' : fileCountVerify.processedCount - fileCountVerify.sourceCount}. 请用 src_processed 运行，并查看 post_process_audit.json`,
+      `[Summary] verify FAILED: stale=${verifyResult.staleRefs} missing=${verifyResult.missingFiles} packRefs=${packMissing} fileCount=${fileCountVerify.ok ? 'OK' : fileCountVerify.processedCount - fileCountVerify.sourceCount}. 请用 src_processed 运行，并查看 post_process_audit.json`,
     );
   } else {
     console.log('[Summary] verify OK — 请使用 src_processed 目录运行游戏');
