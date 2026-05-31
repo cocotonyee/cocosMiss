@@ -4,5 +4,5 @@
   "canAudioSwitch": true,
   "obfuscationPreferRatio": 1.3,
   "obfuscationMaxRatio": 1.6,
-  "imageColorIntensity": 10
+  "imageColorIntensity": 3
 }

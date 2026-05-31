@@ -7,7 +7,14 @@ const { ObfuscatorPool } = require('./obfuscator-pool');
 
 let _sharp;
 function getSharp() {
-  if (!_sharp) _sharp = require('sharp');
+  if (!_sharp) {
+    _sharp = require('sharp');
+    // Windows 上 libvips 多线程 + 多任务并发易卡住、文件锁 EPERM
+    if (process.platform === 'win32') {
+      _sharp.cache(false);
+      _sharp.concurrency(1);
+    }
+  }
   return _sharp;
 }
 
@@ -264,16 +271,19 @@ function getCpuCount() {
 }
 
 function getNativeConcurrency() {
-  const cpus = getCpuCount();
-  // Windows 上 Sharp 并发过高会极慢（磁盘/CPU 争抢）
-  if (process.platform === 'win32') return Math.min(2, Math.max(1, Math.floor(cpus / 4)));
-  return Math.min(6, Math.max(3, cpus - 2));
+  const flags = getFeatureFlags();
+  // 图片/音频走 Sharp 或 FFmpeg，必须串行，否则 Windows 长时间卡住
+  if (flags.CAN_IMAGE_SWITCH || flags.CAN_AUDIO_SWITCH) return 1;
+  if (process.platform === 'win32') return 2;
+  return 4;
 }
 
 function getBundleConcurrency() {
+  const flags = getFeatureFlags();
+  if (flags.CAN_IMAGE_SWITCH || flags.CAN_AUDIO_SWITCH) return 1;
   const cpus = getCpuCount();
-  if (process.platform === 'win32') return Math.min(3, Math.max(2, Math.floor(cpus / 2)));
-  return Math.min(6, Math.max(2, getCpuCount() - 1));
+  if (process.platform === 'win32') return Math.min(2, Math.max(1, Math.floor(cpus / 2)));
+  return Math.min(4, Math.max(2, cpus - 2));
 }
 
 function getObfuscationConcurrency() {
@@ -389,9 +399,6 @@ function buildImageEncodeOptions(ext, meta) {
     const options = {
       quality,
       mozjpeg: true,
-      trellisQuantisation: true,
-      overshootDeringing: true,
-      optimizeScans: true,
       chromaSubsampling: meta.chromaSubsampling === '4:4:4' ? '4:4:4' : '4:2:0',
     };
     if (meta.isProgressive) options.progressive = true;
@@ -410,7 +417,7 @@ function buildImageEncodeOptions(ext, meta) {
         palette: true,
         colors: Math.min(Math.max(colors, 2), 256),
         compressionLevel,
-        effort: 7,
+        effort: 1,
       },
     };
   }
@@ -419,8 +426,8 @@ function buildImageEncodeOptions(ext, meta) {
     type: 'png',
     options: {
       compressionLevel,
-      effort: 7,
-      adaptiveFiltering: true,
+      effort: 1,
+      adaptiveFiltering: false,
     },
   };
 }
@@ -432,26 +439,27 @@ async function rehashImage(inputPath, outputPath) {
   const intensity = getFeatureFlags().IMAGE_COLOR_INTENSITY;
   const mod = randomColorModulation();
   const started = Date.now();
-  const meta = await getSharp()(inputPath).metadata();
+
+  const image = getSharp()(inputPath, { failOn: 'none' });
+  const meta = await image.metadata();
   const encode = buildImageEncodeOptions(ext, meta);
 
-  let pipeline = getSharp()(inputPath).modulate(mod);
-  pipeline = encode.type === 'jpeg'
-    ? pipeline.removeAlpha().jpeg(encode.options)
-    : pipeline.png(encode.options);
+  const pipeline = encode.type === 'jpeg'
+    ? image.modulate(mod).removeAlpha().jpeg(encode.options)
+    : image.modulate(mod).png(encode.options);
 
-  const buffer = await pipeline.toBuffer();
-  await fs.writeFile(outputPath, buffer);
+  await pipeline.toFile(outputPath);
 
+  const outSize = fs.statSync(outputPath).size;
   const ms = Date.now() - started;
-  const sizeDelta = (buffer.length - originalSize) / originalSize;
+  const sizeDelta = (outSize - originalSize) / originalSize;
   if (Math.abs(sizeDelta) > IMAGE_SIZE_WARN_RATIO) {
     const sign = sizeDelta >= 0 ? '+' : '';
     console.warn(
-      `Image size ${sign}${(sizeDelta * 100).toFixed(0)}% (强度${intensity}): ${path.basename(inputPath)} ${originalSize}→${buffer.length}B`,
+      `Image size ${sign}${(sizeDelta * 100).toFixed(0)}% (强度${intensity}): ${path.basename(inputPath)} ${originalSize}→${outSize}B`,
     );
   }
-  if (ms > 2000) {
+  if (ms > 3000) {
     console.log(`Image done (${(ms / 1000).toFixed(1)}s): ${path.basename(inputPath)}`);
   }
 }
@@ -475,11 +483,8 @@ async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
     await fs.rename(tempPath, outputPath);
   } catch (err) {
     await forceRemoveFile(tempPath).catch(() => {});
-    if (!fs.existsSync(outputPath)) {
-      await fs.copy(inputPath, outputPath);
-      return;
-    }
-    throw err;
+    console.warn(`Process native fallback copy: ${path.basename(inputPath)} (${err.message})`);
+    await fs.copy(inputPath, outputPath);
   }
 }
 
