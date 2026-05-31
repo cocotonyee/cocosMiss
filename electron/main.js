@@ -1,14 +1,14 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, utilityProcess, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fse = require('fs-extra');
 const { ensureDependencies, getProjectRoot } = require('./deps');
 const licenseService = require('../license-service');
-const { resolveUnpackPath, resolveCoreRoot } = require('./worker-path');
+const { resolveCoreRoot } = require('./worker-path');
+const { loadCore } = require('./load-core');
 
 let mainWindow = null;
 let isProcessing = false;
-let activeWorker = null;
 let depsReady = false;
 
 function getResourcesRoot() {
@@ -191,22 +191,8 @@ function getWorkerEnv() {
     MILFUN_EXE_DIR: getExeDir(),
     MILFUN_LICENSE_DIR: getLicenseDir(),
     MILFUN_CORE_ROOT: coreRoot,
-    MILFUN_IN_WORKER: '1',
     NODE_PATH: nodePath,
   };
-}
-
-function getWorkerCwd() {
-  if (app.isPackaged) return getResourcesRoot();
-  return getProjectRoot();
-}
-
-function getWorkerScript(name) {
-  const scriptPath = resolveUnpackPath(__dirname, name);
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`找不到 worker 脚本: ${scriptPath}`);
-  }
-  return scriptPath;
 }
 
 function send(channel, payload) {
@@ -215,98 +201,45 @@ function send(channel, payload) {
   }
 }
 
-function runPipelineInWorker(options) {
-  return new Promise((resolve, reject) => {
-    const workerPath = getWorkerScript('pipeline-worker.js');
-    logLine('info', `[Worker] 启动: ${workerPath}`);
-    let settled = false;
+async function runPipelineInMain(options) {
+  Object.assign(process.env, getWorkerEnv());
+  require('./worker-bootstrap');
 
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      activeWorker = null;
-      fn(value);
-    };
+  const coreRoot = getCoreRoot();
+  logLine('info', `[Core] 主进程加载: ${coreRoot}`);
+  send('progress', { step: 0, total: 6, message: '正在加载核心模块...' });
 
-    const child = utilityProcess.fork(workerPath, [], {
-      serviceName: 'MilFun Pipeline',
-      env: getWorkerEnv(),
-      stdio: 'pipe',
-      cwd: getWorkerCwd(),
-    });
-    activeWorker = child;
+  await new Promise((resolve) => setImmediate(resolve));
 
-    child.stdout?.on('data', (data) => {
-      const text = data.toString().trim();
-      if (text) send('log', { level: 'warn', message: text });
-    });
+  const core = loadCore(coreRoot, (level, message) => logLine(level, message));
 
-    child.stderr?.on('data', (data) => {
-      const text = data.toString().trim();
-      if (text) send('log', { level: 'error', message: text });
-    });
+  send('progress', { step: 0, total: 6, message: '正在处理资源...' });
 
-    child.on('message', (msg) => {
-      if (!msg || !msg.type) return;
-      if (msg.type === 'log') {
-        send('log', { level: msg.level || 'info', message: msg.message });
-      }
-      if (msg.type === 'progress') {
-        send('progress', { step: msg.step, total: msg.total, message: msg.message });
-        if (msg.message) {
-          send('log', { level: 'info', message: msg.message });
-        }
-      }
-      if (msg.type === 'done') {
-        send('done', {
-          zipPath: msg.zipPath,
-          processedDir: msg.processedDir,
-          workspaceDir: getWorkspaceDir(),
-        });
-        finish(resolve, {
-          ok: true,
-          zipPath: msg.zipPath,
-          processedDir: msg.processedDir,
-          workspaceDir: getWorkspaceDir(),
-        });
-      }
-      if (msg.type === 'error') {
-        send('error', { message: msg.message });
-        finish(reject, new Error(msg.message));
-      }
-    });
-
-    child.on('exit', (code) => {
-      if (!settled) {
-        const err = new Error(code === 0 ? '处理进程意外退出' : `处理进程异常退出 (code=${code})`);
-        send('log', { level: 'error', message: err.message });
-        send('error', { message: err.message });
-        finish(reject, err);
-      }
-    });
-
-    child.on('spawn', () => {
-      try {
-        logLine('info', '[Worker] 进程已启动');
-        const payload = {
-          type: 'run',
-          env: getWorkerEnv(),
-          coreRoot: getCoreRoot(),
-          appRoot: getWorkspaceDir(),
-          sourceDir: options.sourceDir,
-          processedDir: options.processedDir,
-          outputDir: options.outputDir,
-        };
-        logLine('info', `[Worker] coreRoot: ${payload.coreRoot}`);
-        child.postMessage(payload);
-      } catch (err) {
-        const message = err.stack || err.message || String(err);
-        logLine('error', `[Worker] 启动消息失败: ${message}`);
-        send('error', { message });
-        finish(reject, err);
-      }
-    });
+  const result = await core.runPipeline({
+    appRoot: options.appRoot,
+    sourceDir: options.sourceDir,
+    processedDir: options.processedDir,
+    outputDir: options.outputDir,
+    trustUiLicense: true,
+    onLog: (level, message) => logLine(level, message),
+    onProgress: (step, total, message) => {
+      send('progress', { step, total, message });
+      if (message) logLine('info', message);
+    },
   });
+
+  send('done', {
+    zipPath: result.zipPath,
+    processedDir: result.processedDir,
+    workspaceDir: getWorkspaceDir(),
+  });
+
+  return {
+    ok: true,
+    zipPath: result.zipPath,
+    processedDir: result.processedDir,
+    workspaceDir: getWorkspaceDir(),
+  };
 }
 
 function createWindow() {
@@ -449,7 +382,8 @@ ipcMain.handle('start-processing', async (_event, sourceDir) => {
   try {
     const stagedSource = await stageSourceToWorkspace(resolvedSource);
     const workspace = getWorkspaceDir();
-    return await runPipelineInWorker({
+    return await runPipelineInMain({
+      appRoot: workspace,
       sourceDir: stagedSource,
       processedDir: path.join(workspace, 'src_processed'),
       outputDir: workspace,
@@ -472,13 +406,6 @@ process.on('uncaughtException', (err) => {
     fs.appendFileSync(logPath, `${new Date().toISOString()} uncaughtException\n${err.stack || err.message}\n`);
   } catch (_) { /* ignore */ }
   dialog.showErrorBox('MilFun 启动错误', err.message || String(err));
-});
-
-app.on('before-quit', () => {
-  if (activeWorker) {
-    activeWorker.kill();
-    activeWorker = null;
-  }
 });
 
 app.on('activate', () => {

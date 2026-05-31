@@ -1,7 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
-const archiver = require('archiver');
 const { exec } = require('child_process');
 
 let _sharp;
@@ -14,6 +13,12 @@ let _JavaScriptObfuscator;
 function getObfuscator() {
   if (!_JavaScriptObfuscator) _JavaScriptObfuscator = require('javascript-obfuscator');
   return _JavaScriptObfuscator;
+}
+
+let _archiver;
+function getArchiver() {
+  if (!_archiver) _archiver = require('archiver');
+  return _archiver;
 }
 
 const {
@@ -512,7 +517,7 @@ function generateFancyZipName(baseName) {
 async function zipDirectory(sourceDir, zipPath) {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = getArchiver()('zip', { zlib: { level: 9 } });
     output.on('close', () => resolve(zipPath));
     archive.on('error', reject);
     archive.pipe(output);

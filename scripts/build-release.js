@@ -18,21 +18,18 @@ const BUILDER_CONFIG = path.join(ROOT, 'electron-builder.release.json');
 
 const RELEASE_OBFUSCATION = {
   compact: true,
-  controlFlowFlattening: true,
-  controlFlowFlatteningThreshold: 0.6,
-  deadCodeInjection: true,
-  deadCodeInjectionThreshold: 0.15,
+  controlFlowFlattening: false,
+  deadCodeInjection: false,
   debugProtection: false,
   disableConsoleOutput: false,
   identifierNamesGenerator: 'hexadecimal',
   renameGlobals: false,
-  selfDefending: true,
+  selfDefending: false,
   simplify: true,
-  splitStrings: true,
-  splitStringsChunkLength: 8,
+  splitStrings: false,
   stringArray: true,
   stringArrayEncoding: ['base64'],
-  stringArrayThreshold: 0.75,
+  stringArrayThreshold: 0.5,
   stringArrayShuffle: true,
   stringArrayRotate: true,
   transformObjectKeys: false,
@@ -71,6 +68,15 @@ async function build() {
     electronPath: require('electron'),
   });
   console.log(`   字节码: ${(fs.statSync(APP_JSC).size / 1024).toFixed(1)}KB`);
+
+  console.log('\n🧪 [2.5/4] 验证 app.jsc 可加载...');
+  delete require.cache[require.resolve('bytenode')];
+  require('bytenode');
+  const smokeCore = require(APP_JSC);
+  if (typeof smokeCore.runPipeline !== 'function') {
+    throw new Error('app.jsc 缺少 runPipeline 导出，请检查混淆/编译配置');
+  }
+  console.log('   app.jsc 加载验证通过');
 
   const platform = process.argv.includes('--win') ? '--win --x64' : process.argv.includes('--mac') ? '--mac' : '--mac';
 

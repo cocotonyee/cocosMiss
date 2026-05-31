@@ -59,18 +59,13 @@ for (const key of ['resolveUnpackPath', 'resolveCoreRoot']) {
 
 // 3. main.js 必须导入 resolveCoreRoot
 const mainSrc = read('electron/main.js');
-for (const sym of ['resolveUnpackPath', 'resolveCoreRoot', 'getProjectRoot', 'ensureDependencies']) {
+for (const sym of ['resolveCoreRoot', 'getProjectRoot', 'ensureDependencies', 'loadCore']) {
   if (!mainSrc.includes(sym)) errors.push(`electron/main.js 未引用: ${sym}`);
 }
-if (!/resolveCoreRoot\s*\}/.test(mainSrc) && !/resolveCoreRoot,\s*resolveUnpackPath/.test(mainSrc) && !/resolveUnpackPath,\s*resolveCoreRoot/.test(mainSrc)) {
-  if (!mainSrc.includes('resolveCoreRoot } = require')) {
-    errors.push('electron/main.js 未从 worker-path 导入 resolveCoreRoot');
-  }
-}
 
-// 4. pipeline-worker 依赖
+// 4. pipeline-worker 依赖（兼容旧版，主流程已改 main 进程）
 const workerSrc = read('electron/pipeline-worker.js');
-for (const sym of ['resolveCoreRoot', 'worker-bootstrap', 'worker-path']) {
+for (const sym of ['loadCore', 'load-core', 'worker-bootstrap']) {
   if (!workerSrc.includes(sym)) errors.push(`pipeline-worker 缺少: ${sym}`);
 }
 
@@ -132,7 +127,7 @@ for (const file of requiredUnpack) {
   }
 }
 
-// 8. require 路径存在性（相对 electron 目录）
+// checkRequires for electron + root loader
 function checkRequires(relativeDir) {
   const dir = path.join(ROOT, relativeDir);
   for (const js of listJsFiles(dir)) {
@@ -153,6 +148,9 @@ function checkRequires(relativeDir) {
   }
 }
 checkRequires('electron');
+
+const loadCoreMod = require(path.join(ELECTRON_DIR, 'load-core.js'));
+if (typeof loadCoreMod.loadCore !== 'function') errors.push('load-core.js 缺少 loadCore');
 
 // 9. app.js 导出 pipeline 所需
 const app = require(path.join(ROOT, 'app.js'));
