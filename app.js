@@ -339,6 +339,24 @@ function listBundleDirs(baseDir) {
     .filter((p) => fs.lstatSync(p).isDirectory());
 }
 
+function getBundleRootNames() {
+  return DIR_CONFIG.BUNDLE_ROOT_NAMES || ['assets', 'subpackages', 'remote'];
+}
+
+function getExistingBundleRoots(processedDir) {
+  return getBundleRootNames()
+    .map((name) => path.join(processedDir, name))
+    .filter((p) => fs.existsSync(p) && fs.lstatSync(p).isDirectory());
+}
+
+function collectAllBundlePaths(processedDir) {
+  const paths = [];
+  for (const root of getExistingBundleRoots(processedDir)) {
+    paths.push(...listBundleDirs(root));
+  }
+  return paths;
+}
+
 async function runWithConcurrency(items, worker, limit = 4) {
   let index = 0;
   async function next() {
@@ -476,16 +494,11 @@ async function applyReplaceCommands(dirPath, replaceCommands, options = {}) {
   let files = options.files;
   if (!files?.length) {
     files = [];
-    if (options.jsOnly) {
-      for (const sub of ['assets', 'subpackages']) {
-        collectTextFiles(path.join(dirPath, sub), files, { jsOnly: true });
-      }
-    } else {
-      for (const sub of ['assets', 'subpackages']) {
-        collectTextFiles(path.join(dirPath, sub), files);
-      }
-      if (!files.length) collectTextFiles(dirPath, files);
+    const scanOpts = options.jsOnly ? { jsOnly: true } : {};
+    for (const root of getExistingBundleRoots(dirPath)) {
+      collectTextFiles(root, files, scanOpts);
     }
+    if (!files.length) collectTextFiles(dirPath, files, scanOpts);
   }
 
   const label = options.label || path.basename(dirPath);
@@ -828,16 +841,11 @@ function buildBundlePathVariants(bundleRelPath, pathSearch, pathReplace) {
 
   const bundleName = path.basename(rel);
   const parent = path.basename(path.dirname(rel));
-  if (parent === 'subpackages') {
+  for (const other of getBundleRootNames()) {
+    if (other === parent) continue;
     variants.push({
-      search: `assets/${bundleName}/${pathSearch}`,
-      replace: `assets/${bundleName}/${pathReplace}`,
-    });
-  }
-  if (parent === 'assets') {
-    variants.push({
-      search: `subpackages/${bundleName}/${pathSearch}`,
-      replace: `subpackages/${bundleName}/${pathReplace}`,
+      search: `${other}/${bundleName}/${pathSearch}`,
+      replace: `${other}/${bundleName}/${pathReplace}`,
     });
   }
   return variants;
@@ -1422,9 +1430,7 @@ function uuidExistsInImportIndex(uuid, suffix, index, resolveMap) {
 
 function buildImportUuidIndex(processedDir) {
   const index = new Map();
-  const scanRoots = ['assets', 'subpackages']
-    .map((name) => path.join(processedDir, name))
-    .filter((dirPath) => fs.existsSync(dirPath));
+  const scanRoots = getExistingBundleRoots(processedDir);
 
   for (const assetsRoot of scanRoots) {
     for (const bundleName of fs.readdirSync(assetsRoot)) {
@@ -1521,9 +1527,7 @@ function verifyPipelineResults(processedDir, results, options = {}) {
   }
 
   const { checks, allNeedles } = buildStaleCheckIndex(results);
-  const scanRoots = ['assets', 'subpackages']
-    .map((name) => path.join(processedDir, name))
-    .filter((dirPath) => fs.existsSync(dirPath));
+  const scanRoots = getExistingBundleRoots(processedDir);
 
   for (const root of scanRoots) {
     const files = collectTextFiles(root);
@@ -1655,9 +1659,7 @@ function pruneEmptyDirectories(rootDir) {
 }
 
 function pruneBundleAssetDirs(processedDir) {
-  for (const base of ['assets', 'subpackages']) {
-    const basePath = path.join(processedDir, base);
-    if (!fs.existsSync(basePath)) continue;
+  for (const basePath of getExistingBundleRoots(processedDir)) {
     for (const bundle of fs.readdirSync(basePath)) {
       const bundlePath = path.join(basePath, bundle);
       if (!fs.lstatSync(bundlePath).isDirectory()) continue;
@@ -1914,23 +1916,22 @@ async function obfuscateJavaScript(filePath, pool) {
   );
 }
 
-function collectObfuscateTargets(subpackagesDir, assetsDir) {
+function collectObfuscateTargets(processedDir) {
   const files = [];
-  for (const bundlePath of listBundleDirs(subpackagesDir)) {
+  for (const bundlePath of collectAllBundlePaths(processedDir)) {
     const gameJsPath = path.join(bundlePath, 'game.js');
     if (fs.existsSync(gameJsPath)) files.push(gameJsPath);
-  }
-  for (const bundlePath of listBundleDirs(assetsDir)) {
-    const gameJsPath = path.join(bundlePath, 'game.js');
-    if (fs.existsSync(gameJsPath)) files.push(gameJsPath);
-    const indexJsFile = fs.readdirSync(bundlePath).find((f) => /index(\..*)?\.js$/.test(f));
-    if (indexJsFile) files.push(path.join(bundlePath, indexJsFile));
+    const parentName = path.basename(path.dirname(bundlePath));
+    if (parentName === 'assets' || parentName === 'remote') {
+      const indexJsFile = fs.readdirSync(bundlePath).find((f) => /index(\..*)?\.js$/.test(f));
+      if (indexJsFile) files.push(path.join(bundlePath, indexJsFile));
+    }
   }
   return files;
 }
 
-async function obfuscateAllBundles(subpackagesDir, assetsDir) {
-  const jsFiles = collectObfuscateTargets(subpackagesDir, assetsDir);
+async function obfuscateAllBundles(processedDir) {
+  const jsFiles = collectObfuscateTargets(processedDir);
   if (!jsFiles.length) return;
 
   const pool = await getObfuscatorPool();
@@ -1947,13 +1948,14 @@ async function obfuscateAllBundles(subpackagesDir, assetsDir) {
 
 const PIPELINE_STEPS = 5;
 
-async function processAllBundles(subpackagesDir, assetsDir, results, globalReplaceCommands, sharedState) {
-  const bundlePaths = [...listBundleDirs(subpackagesDir), ...listBundleDirs(assetsDir)];
+async function processAllBundles(processedDir, results, globalReplaceCommands, sharedState) {
+  const bundlePaths = collectAllBundlePaths(processedDir);
+  const rootNames = getExistingBundleRoots(processedDir).map((p) => path.basename(p));
   preassignSharedUuids(bundlePaths, sharedState);
   const bundleConcurrency = getBundleConcurrency();
   const nativeConcurrency = getNativeConcurrency();
   console.log(
-    `[Pipeline] bundles=${bundlePaths.length} bundleWorkers=${bundleConcurrency} nativeWorkers=${nativeConcurrency}`,
+    `[Pipeline] roots=[${rootNames.join(',')}] bundles=${bundlePaths.length} bundleWorkers=${bundleConcurrency} nativeWorkers=${nativeConcurrency}`,
   );
   await runWithConcurrency(
     bundlePaths,
@@ -1967,13 +1969,10 @@ async function main(options = {}) {
   const sourceDir = options.sourceDir || path.join(appRoot, 'src');
   const processedDir = options.processedDir || path.join(appRoot, 'src_processed');
   const onProgress = options.onProgress || null;
-  const { ASSETS_DIR, SUBPACKAGE_DIR } = DIR_CONFIG;
 
   const results = [];
   const globalReplaceCommands = [];
   const sharedUuidState = createSharedUuidState();
-  const subpackagesDir = path.join(processedDir, SUBPACKAGE_DIR);
-  const assetsDir = path.join(processedDir, ASSETS_DIR);
 
   const step = (n, msg) => {
     const line = `[${n}/${PIPELINE_STEPS}] ${msg}`;
@@ -1991,7 +1990,7 @@ async function main(options = {}) {
   copyDirRecursive(sourceDir, processedDir);
 
   step(3, 'Processing bundles (parallel)...');
-  await processAllBundles(subpackagesDir, assetsDir, results, globalReplaceCommands, sharedUuidState);
+  await processAllBundles(processedDir, results, globalReplaceCommands, sharedUuidState);
   if (sharedUuidState.uuidRegistry.size) {
     console.log(`[Pipeline] shared UUID registry: ${sharedUuidState.uuidRegistry.size} unique asset(s)`);
   }
@@ -2037,8 +2036,8 @@ async function main(options = {}) {
   });
 
   step(5, 'Obfuscating bundle JavaScript (parallel)...');
-  const obfuscatedJs = collectObfuscateTargets(subpackagesDir, assetsDir);
-  await obfuscateAllBundles(subpackagesDir, assetsDir);
+  const obfuscatedJs = collectObfuscateTargets(processedDir);
+  await obfuscateAllBundles(processedDir);
 
   if (globalReplaceCommands.length) {
     console.log('[Repair] post-obfuscation UUID replace pass...');

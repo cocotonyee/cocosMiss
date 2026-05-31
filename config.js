@@ -25,6 +25,9 @@ const DIR_CONFIG = {
   PROCESSED_DIR: path.join(__dirname, 'src_processed'),
   SUBPACKAGE_DIR: 'subpackages',
   ASSETS_DIR: 'assets',
+  REMOTE_DIR: 'remote',
+  /** 与 Cocos 构建产物一致的 bundle 根目录（存在才处理） */
+  BUNDLE_ROOT_NAMES: ['assets', 'subpackages', 'remote'],
 };
 
 // 白名单 - 不混淆的 JavaScript 文件
