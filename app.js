@@ -1,10 +1,20 @@
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
-const sharp = require('sharp');
 const archiver = require('archiver');
-const JavaScriptObfuscator = require('javascript-obfuscator');
 const { exec } = require('child_process');
+
+let _sharp;
+function getSharp() {
+  if (!_sharp) _sharp = require('sharp');
+  return _sharp;
+}
+
+let _JavaScriptObfuscator;
+function getObfuscator() {
+  if (!_JavaScriptObfuscator) _JavaScriptObfuscator = require('javascript-obfuscator');
+  return _JavaScriptObfuscator;
+}
 
 const {
   DIR_CONFIG,
@@ -252,7 +262,7 @@ function isInWhitelist(filePath) {
 async function rehashImage(inputPath, outputPath) {
   await ensureDirectoryExists(outputPath);
   const ext = path.extname(inputPath).toLowerCase();
-  let pipeline = sharp(inputPath);
+  let pipeline = getSharp()(inputPath);
 
   if (CAN_IMAGE_SWITCH) {
     const compressionLevel = crypto.randomInt(0, 10);
@@ -450,7 +460,7 @@ function obfuscateJavaScript(filePath) {
     const { maxRatio, label, ...options } = preset;
     const seed = crypto.randomInt(0, 1000000);
     try {
-      const result = JavaScriptObfuscator.obfuscate(original, { ...options, seed }).getObfuscatedCode();
+      const result = getObfuscator().obfuscate(original, { ...options, seed }).getObfuscatedCode();
       const ratio = result.length / originalSize;
       if (ratio <= maxRatio) {
         bestCode = result;
@@ -682,7 +692,7 @@ module.exports = {
   runPipeline,
 };
 
-if (require.main === module && !process.versions.electron) {
+if (require.main === module && !process.versions.electron && !process.env.MILFUN_IN_WORKER) {
   const app = new ProtectedApplication();
   app.initialize();
 }

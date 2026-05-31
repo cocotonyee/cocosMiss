@@ -26,10 +26,16 @@ function loadCore(coreRoot) {
   const loaderPath = path.join(root, 'loader-core.js');
   const jsPath = path.join(root, 'app.js');
 
+  emit({ type: 'log', level: 'info', message: `[Core] 目录: ${root}` });
+
   if (fs.existsSync(jscPath) && fs.existsSync(loaderPath)) {
-    return require(loaderPath);
+    emit({ type: 'log', level: 'info', message: '[Core] 加载 app.jsc 字节码...' });
+    const core = require(loaderPath);
+    emit({ type: 'log', level: 'info', message: '[Core] 字节码加载完成' });
+    return core;
   }
   if (fs.existsSync(jsPath)) {
+    emit({ type: 'log', level: 'info', message: '[Core] 加载 app.js...' });
     return require(jsPath);
   }
   throw new Error(`找不到核心模块，目录: ${root}`);
@@ -45,13 +51,16 @@ onCommand(async (msg) => {
       }
     }
 
+    process.env.MILFUN_IN_WORKER = '1';
+    require('./worker-bootstrap');
+
     emit({ type: 'progress', step: 0, total: 6, message: '正在启动处理进程...' });
     emit({ type: 'log', level: 'info', message: 'MilFun Start...' });
     emit({ type: 'progress', step: 0, total: 6, message: '正在加载核心模块...' });
 
     const loadTimer = setInterval(() => {
-      emit({ type: 'progress', step: 0, total: 6, message: '正在加载核心模块...' });
-    }, 2000);
+      emit({ type: 'log', level: 'info', message: '[Core] 仍在加载（首次可能较慢）...' });
+    }, 5000);
 
     let core;
     try {
@@ -84,7 +93,7 @@ onCommand(async (msg) => {
     });
     process.exit(0);
   } catch (err) {
-    emit({ type: 'log', level: 'error', message: err.message || String(err) });
+    emit({ type: 'log', level: 'error', message: err.stack || err.message || String(err) });
     emit({ type: 'error', message: err.message || String(err) });
     process.exit(1);
   }

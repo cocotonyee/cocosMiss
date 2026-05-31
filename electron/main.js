@@ -173,11 +173,20 @@ function getAppRoot() {
 
 function getWorkerEnv() {
   setupCoreEnv();
+  const resources = getResourcesRoot();
+  const modulePaths = [
+    path.join(resources, 'app.asar.unpacked', 'node_modules'),
+    path.join(resources, 'app.asar', 'node_modules'),
+  ].filter((p) => fs.existsSync(p));
+  const nodePath = [...modulePaths, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+
   return {
-    MILFUN_APP_ROOT: getResourcesRoot(),
+    MILFUN_APP_ROOT: resources,
     MILFUN_EXE_DIR: getExeDir(),
     MILFUN_LICENSE_DIR: getLicenseDir(),
     MILFUN_CORE_ROOT: getAppRoot(),
+    MILFUN_IN_WORKER: '1',
+    NODE_PATH: nodePath,
   };
 }
 
@@ -274,7 +283,7 @@ function runPipelineInWorker(options) {
       child.postMessage({
         type: 'run',
         env: getWorkerEnv(),
-        coreRoot: getAppRoot(),
+        coreRoot: resolveCoreRoot(getAppRoot()),
         appRoot: getWorkspaceDir(),
         sourceDir: options.sourceDir,
         processedDir: options.processedDir,
