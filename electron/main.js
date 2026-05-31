@@ -64,7 +64,12 @@ function getDefaultSourceDir() {
   return path.join(getWorkspaceDir(), 'src');
 }
 
-const REMOVE_OPTS = { maxRetries: 5, retryDelay: 300 };
+const REMOVE_OPTS = { recursive: true, force: true, maxRetries: 5, retryDelay: 300 };
+
+async function removeDir(dir) {
+  if (!fs.existsSync(dir)) return;
+  await fs.promises.rm(dir, REMOVE_OPTS);
+}
 
 function samePath(a, b) {
   const pa = path.resolve(a);
@@ -134,14 +139,14 @@ async function stageSourceToWorkspace(externalSource) {
 
   try {
     logLine('info', '[源码] 清理临时目录...');
-    await fse.remove(tempSrc, REMOVE_OPTS);
+    await removeDir(tempSrc);
 
     logLine('info', '[源码] 开始复制（大项目可能需要数分钟）...');
     send('progress', { step: 0, total: 6, message: '正在复制源码...' });
     await copyWithProgress(externalSource, tempSrc);
 
     logLine('info', '[源码] 清理旧 src...');
-    await fse.remove(localSrc, REMOVE_OPTS);
+    await removeDir(localSrc);
 
     logLine('info', '[源码] 移动到程序目录...');
     await fse.move(tempSrc, localSrc, { overwrite: true });
@@ -150,7 +155,7 @@ async function stageSourceToWorkspace(externalSource) {
     return localSrc;
   } catch (err) {
     logLine('error', `[源码] 失败: ${err.message}`);
-    await fse.remove(tempSrc, REMOVE_OPTS).catch(() => {});
+    await removeDir(tempSrc).catch(() => {});
     throw err;
   }
 }
