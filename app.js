@@ -310,6 +310,10 @@ async function runWithConcurrency(items, worker, limit = 4) {
 }
 
 function copyDirRecursive(src, dest) {
+  if (typeof fs.cpSync === 'function') {
+    fs.cpSync(src, dest, { recursive: true, force: true });
+    return;
+  }
   if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
   for (const item of fs.readdirSync(src)) {
     const srcPath = path.join(src, item);
@@ -344,39 +348,127 @@ function sortReplaceCommands(commands) {
   return [...commands].sort((a, b) => b.search.length - a.search.length);
 }
 
-function processDirectory(dirPath, replaceCommands) {
-  const ordered = sortReplaceCommands(replaceCommands);
+function getReplaceConcurrency() {
+  return Math.min(8, Math.max(2, getCpuCount()));
+}
+
+const REPLACE_SKIP_DIRS = new Set([
+  'cocos',
+  'cocos-js',
+  'node_modules',
+  '@babel',
+  'engine',
+  'physics',
+  'polyfills.bundle',
+  'system.bundle',
+  'web-adapter',
+]);
+
+function shouldSkipReplaceDir(name) {
+  return REPLACE_SKIP_DIRS.has(name);
+}
+
+function collectTextFiles(dirPath, out = [], options = {}) {
+  if (!fs.existsSync(dirPath)) return out;
+  const exts = options.jsOnly ? ['.js'] : FILE_EXTENSIONS.TEXT;
   for (const item of fs.readdirSync(dirPath)) {
     const itemPath = path.join(dirPath, item);
     if (fs.lstatSync(itemPath).isDirectory()) {
-      processDirectory(itemPath, ordered);
-    } else if (FILE_EXTENSIONS.TEXT.includes(path.extname(itemPath).toLowerCase())) {
-      let content = fs.readFileSync(itemPath, 'utf8');
-      let changed = false;
-      for (const cmd of ordered) {
-        const escapedSearch = escapeRegExp(cmd.search);
-        const newContent = content.replace(new RegExp(escapedSearch, 'g'), cmd.replace);
-        if (newContent !== content) changed = true;
-        content = newContent;
-      }
-      if (changed) fs.writeFileSync(itemPath, content, 'utf8');
+      if (shouldSkipReplaceDir(item)) continue;
+      collectTextFiles(itemPath, out, options);
+      continue;
     }
+    const ext = path.extname(itemPath).toLowerCase();
+    if (exts.includes(ext)) out.push(itemPath);
   }
+  return out;
 }
 
-function applyReplaceCommands(dirPath, replaceCommands) {
-  if (!replaceCommands.length) return;
+function buildReplacePlan(replaceCommands) {
   const withAt = replaceCommands.filter((c) => c.hasAt);
-  const withoutAt = replaceCommands.filter((c) => !c.hasAt);
-  if (withAt.length) {
-    console.log(`Applying ${withAt.length} replace commands (with @) in ${path.basename(dirPath)}`);
-    processDirectory(dirPath, withAt);
+  const withoutAt = sortReplaceCommands(replaceCommands.filter((c) => !c.hasAt));
+  const needles = [...new Set(replaceCommands.map((c) => c.search).filter(Boolean))];
+  return { withAt, withoutAt, needles };
+}
+
+function contentMightMatch(content, needles) {
+  for (let i = 0; i < needles.length; i++) {
+    if (content.includes(needles[i])) return true;
   }
-  if (withoutAt.length) {
-    const sorted = sortReplaceCommands(withoutAt);
-    console.log(`Applying ${sorted.length} replace commands (without @, longest-first) in ${path.basename(dirPath)}`);
-    processDirectory(dirPath, sorted);
+  return false;
+}
+
+function applyReplaceToFileContent(content, withAt, withoutAt) {
+  let changed = false;
+  for (const cmd of withAt) {
+    if (!content.includes(cmd.search)) continue;
+    const next = content.replace(new RegExp(escapeRegExp(cmd.search), 'g'), cmd.replace);
+    if (next !== content) {
+      content = next;
+      changed = true;
+    }
   }
+  for (const cmd of withoutAt) {
+    if (!content.includes(cmd.search)) continue;
+    const next = content.split(cmd.search).join(cmd.replace);
+    if (next !== content) {
+      content = next;
+      changed = true;
+    }
+  }
+  return { content, changed };
+}
+
+function processTextFile(filePath, withAt, withoutAt, needles) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  if (!contentMightMatch(content, needles)) return false;
+  const { content: next, changed } = applyReplaceToFileContent(content, withAt, withoutAt);
+  if (changed) fs.writeFileSync(filePath, next, 'utf8');
+  return changed;
+}
+
+async function applyReplaceCommands(dirPath, replaceCommands, options = {}) {
+  if (!replaceCommands.length) return 0;
+
+  const plan = buildReplacePlan(replaceCommands);
+  let files = options.files;
+  if (!files?.length) {
+    files = [];
+    if (options.jsOnly) {
+      for (const sub of ['assets', 'subpackages']) {
+        collectTextFiles(path.join(dirPath, sub), files, { jsOnly: true });
+      }
+    } else {
+      for (const sub of ['assets', 'subpackages']) {
+        collectTextFiles(path.join(dirPath, sub), files);
+      }
+      if (!files.length) collectTextFiles(dirPath, files);
+    }
+  }
+
+  const label = options.label || path.basename(dirPath);
+  console.log(
+    `[Replace] ${label}: ${files.length} file(s), ${plan.withAt.length} @ cmds, ${plan.withoutAt.length} plain cmds`,
+  );
+
+  let updated = 0;
+  let processed = 0;
+  const concurrency = options.concurrency || getReplaceConcurrency();
+  const onProgress = options.onProgress;
+  await runWithConcurrency(
+    files,
+    async (filePath) => {
+      if (processTextFile(filePath, plan.withAt, plan.withoutAt, plan.needles)) updated++;
+      processed++;
+      if (processed % 32 === 0) {
+        onProgress?.(4, PIPELINE_STEPS, `Replacing UUIDs (${processed}/${files.length})...`);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    },
+    concurrency,
+  );
+  console.log(`[Replace] ${label}: updated ${updated}/${files.length} file(s)`);
+  return updated;
 }
 
 function isInWhitelist(filePath) {
@@ -515,6 +607,13 @@ async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
   }
 }
 
+async function removePathAfterMove(oldPath, newPath) {
+  if (!oldPath || !newPath) return;
+  if (path.resolve(oldPath) === path.resolve(newPath)) return;
+  if (!isValidOutputFile(newPath) || !fs.existsSync(oldPath)) return;
+  await forceRemoveFile(oldPath);
+}
+
 async function moveNativeFile(inputPath, outputPath, fileExt) {
   if (path.resolve(inputPath) === path.resolve(outputPath)) return;
 
@@ -528,7 +627,7 @@ async function moveNativeFile(inputPath, outputPath, fileExt) {
   if (!isValidOutputFile(outputPath)) {
     throw new Error(`Failed to write native file: ${path.basename(outputPath)}`);
   }
-  // 保留旧路径文件，避免引用未替换完时运行报 does not exist
+  await removePathAfterMove(inputPath, outputPath);
 }
 
 // ─── JSON 迁移 ──────────────────────────────────────────────
@@ -576,6 +675,7 @@ async function migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplac
     );
     const raw = fs.readFileSync(jsonFilePath, 'utf8');
     fs.writeFileSync(newJsonPath, applyReplaceToContent(raw, replaceCommands), 'utf8');
+    await removePathAfterMove(jsonFilePath, newJsonPath);
     importMigrations.push({ originalImportPath: jsonFilePath, newImportPath: newJsonPath });
     console.log(`Migrated JSON: ${foundJsonFile} → ${newJsonFileName}`);
   }
@@ -624,11 +724,9 @@ function pushImportJsonPathCommands(commands, bundleRel, origPrefix, newPrefix, 
 }
 
 function applyReplaceToContent(content, replaceCommands) {
-  let result = content;
-  for (const cmd of replaceCommands) {
-    result = result.replace(new RegExp(escapeRegExp(cmd.search), 'g'), cmd.replace);
-  }
-  return result;
+  const plan = buildReplacePlan(replaceCommands);
+  if (!contentMightMatch(content, plan.needles)) return content;
+  return applyReplaceToFileContent(content, plan.withAt, plan.withoutAt).content;
 }
 
 function buildPlanReplaceCommands(plan) {
@@ -874,36 +972,6 @@ function pushImportOnlyReplaceCommands(commands, plan, options = {}) {
   pushUuidReplaceCommands(commands, plan, options.uuidReplaceDedupe);
 }
 
-function buildNativeImportJsonStub(fileExt) {
-  const nativeExt = fileExt.toLowerCase();
-  return `[1,0,0,[["cc.Texture2D",["_native"],1]],[[0,0,1,3]],[[0,"${nativeExt}"]],0,0,[],[],[]]`;
-}
-
-async function ensureNativeImportJsonStub(subpackageDir, uuidAndExtra, plan, fileExt, resultItem) {
-  if (!FILE_EXTENSIONS.IMAGE.includes(fileExt.toLowerCase()) || uuidAndExtra.notUUid) return null;
-
-  const renamedUUID = plan.renamedUUID;
-  const prefix = renamedUUID.substring(0, 2);
-  const importPath = path.join(subpackageDir, 'import', prefix, `${renamedUUID}.json`);
-  if (isValidOutputFile(importPath)) return null;
-
-  await ensureDirectoryExists(importPath);
-  fs.writeFileSync(importPath, buildNativeImportJsonStub(fileExt), 'utf8');
-  console.log(`Created native import stub: ${path.basename(importPath)}`);
-
-  const originalImportPath = path.join(
-    subpackageDir,
-    'import',
-    uuidAndExtra.uuid.substring(0, 2),
-    `${uuidAndExtra.uuid}.json`,
-  );
-  const migration = { originalImportPath, newImportPath: importPath, stub: true };
-  if (resultItem) {
-    resultItem.importMigrations = (resultItem.importMigrations || []).concat([migration]);
-  }
-  return migration;
-}
-
 async function copyNativeFallback(inputPath, outputPath, reason) {
   if (!fs.existsSync(inputPath)) {
     throw new Error(`Source missing for fallback copy: ${path.basename(inputPath)}`);
@@ -969,7 +1037,6 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
     results.push(resultItem);
     patchBundleConfig(subpackageDir, plan);
     await migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem);
-    await ensureNativeImportJsonStub(subpackageDir, uuidAndExtra, plan, fileExt, resultItem);
   } catch (err) {
     console.error(`[Asset] failed ${file}: ${err.message}`);
     if (!isValidOutputFile(newPath) && fs.existsSync(originalPath)) {
@@ -981,7 +1048,6 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
       patchBundleConfig(subpackageDir, plan);
       try {
         await migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem);
-        await ensureNativeImportJsonStub(subpackageDir, uuidAndExtra, plan, fileExt, resultItem);
       } catch (migrateErr) {
         console.warn(`[Asset] import migrate failed for ${file}: ${migrateErr.message}`);
       }
@@ -1011,6 +1077,7 @@ async function migrateCompanionNative(subpackageDir, uuidAndExtra, plan, nativeF
   }
   await ensureDirectoryExists(newNativePath);
   await fs.copy(originalNativePath, newNativePath);
+  await removePathAfterMove(originalNativePath, newNativePath);
   console.log(`Migrated companion native: ${nestedRelative} → ${newNestedRelative}`);
   return { originalNativePath, newNativePath };
 }
@@ -1034,6 +1101,7 @@ async function processImportOnlyAsset(subpackageDir, importSubDir, file, uuidAnd
   const replaceCommands = buildPlanReplaceCommands(plan);
   const raw = fs.readFileSync(originalPath, 'utf8');
   fs.writeFileSync(newPath, applyReplaceToContent(raw, replaceCommands), 'utf8');
+  await removePathAfterMove(originalPath, newPath);
 
   pushImportOnlyReplaceCommands(globalReplaceCommands, plan, { uuidReplaceDedupe: sharedState.uuidReplaceDedupe });
   pushImportJsonPathCommands(
@@ -1197,92 +1265,11 @@ function buildImportUuidIndex(processedDir) {
   return index;
 }
 
-function collectPackReferencedUuids(importRoot) {
-  const uuids = new Set();
-  if (!fs.existsSync(importRoot)) return uuids;
-
-  const walk = (dirPath) => {
-    for (const entry of fs.readdirSync(dirPath)) {
-      const entryPath = path.join(dirPath, entry);
-      if (fs.lstatSync(entryPath).isDirectory()) {
-        walk(entryPath);
-        continue;
-      }
-      if (!entry.endsWith('.json')) continue;
-      const content = fs.readFileSync(entryPath, 'utf8');
-      for (const encoded of collectPackEncodedUuids(content)) {
-        const uuid = decodeCocosEncodedUuid(encoded);
-        if (uuid) uuids.add(uuid);
-      }
-    }
-  };
-  walk(importRoot);
-  return uuids;
-}
-
-async function mirrorNativeForImportJson(targetBundleDir, sourceImportPath, sourceBundleDir) {
-  const raw = fs.readFileSync(sourceImportPath, 'utf8');
-  const nativeFileName = extractNativeFileNameFromImportJson(raw);
-  if (!nativeFileName) return false;
-
-  const uuid = path.basename(sourceImportPath, '.json').split('@')[0];
-  const prefix = uuid.substring(0, 2);
-  const candidates = [
-    path.join(sourceBundleDir, 'native', prefix, uuid, nativeFileName),
-    path.join(sourceBundleDir, 'native', prefix, `${uuid}${path.extname(nativeFileName)}`),
-    path.join(sourceBundleDir, 'native', prefix, nativeFileName),
-  ];
-
-  for (const srcNative of candidates) {
-    if (!isValidOutputFile(srcNative)) continue;
-    const relNative = path.relative(path.join(sourceBundleDir, 'native'), srcNative);
-    const dstNative = path.join(targetBundleDir, 'native', relNative);
-    if (isValidOutputFile(dstNative)) return true;
-    await ensureDirectoryExists(dstNative);
-    await fs.copy(srcNative, dstNative);
-    return true;
-  }
-  return false;
-}
-
-async function ensureCrossBundleImportMirrors(processedDir) {
-  const assetsRoot = path.join(processedDir, 'assets');
-  if (!fs.existsSync(assetsRoot)) return 0;
-
-  const importIndex = buildImportUuidIndex(processedDir);
-  let copied = 0;
-
-  for (const bundleName of fs.readdirSync(assetsRoot)) {
-    const bundleDir = path.join(assetsRoot, bundleName);
-    const importRoot = path.join(bundleDir, 'import');
-    const neededUuids = collectPackReferencedUuids(importRoot);
-
-    for (const uuid of neededUuids) {
-      const targetImport = path.join(importRoot, uuid.substring(0, 2), `${uuid}.json`);
-      if (isValidOutputFile(targetImport)) continue;
-
-      const source = importIndex.get(uuid);
-      if (!source) continue;
-
-      await ensureDirectoryExists(targetImport);
-      await fs.copy(source.importPath, targetImport);
-      await mirrorNativeForImportJson(bundleDir, source.importPath, source.bundleDir);
-      importIndex.set(uuid, { importPath: targetImport, bundleDir });
-      copied++;
-    }
-  }
-
-  if (copied) {
-    console.warn(`[Mirror] copied ${copied} cross-bundle import JSON file(s)`);
-  }
-  return copied;
-}
-
-function verifyBundlePackImportRefs(processedDir) {
+function verifyBundlePackImportRefs(processedDir, importIndex) {
   const assetsRoot = path.join(processedDir, 'assets');
   if (!fs.existsSync(assetsRoot)) return { missingPackImports: 0, samples: [] };
 
-  const importIndex = buildImportUuidIndex(processedDir);
+  const index = importIndex || buildImportUuidIndex(processedDir);
   const samples = [];
   let missingPackImports = 0;
 
@@ -1301,16 +1288,13 @@ function verifyBundlePackImportRefs(processedDir) {
         const content = fs.readFileSync(entryPath, 'utf8');
         for (const encoded of collectPackEncodedUuids(content)) {
           const uuid = decodeCocosEncodedUuid(encoded);
-          if (!uuid || !importIndex.has(uuid)) continue;
-          const importPath = path.join(importRoot, uuid.substring(0, 2), `${uuid}.json`);
-          if (isValidOutputFile(importPath)) continue;
+          if (!uuid || index.has(uuid)) continue;
           missingPackImports++;
           if (samples.length < 10) {
             samples.push({
               bundle: bundleName,
               pack: path.relative(importRoot, entryPath),
               uuid,
-              expected: path.relative(processedDir, importPath),
             });
           }
         }
@@ -1320,15 +1304,54 @@ function verifyBundlePackImportRefs(processedDir) {
   }
 
   if (samples.length) {
-    console.error(`[Verify] ${missingPackImports} pack import ref(s) missing in bundle, samples:`);
+    console.error(`[Verify] ${missingPackImports} pack ref(s) point to missing import UUID(s), samples:`);
     for (const sample of samples.slice(0, 5)) {
-      console.error(`  ${sample.bundle}/${sample.pack} → ${sample.expected}`);
+      console.error(`  ${sample.bundle}/${sample.pack} → uuid ${sample.uuid}`);
     }
   }
   return { missingPackImports, samples };
 }
 
-function verifyPipelineResults(processedDir, results) {
+function buildStaleCheckIndex(results) {
+  const checks = [];
+  const allNeedles = [];
+  const needleSet = new Set();
+
+  for (const result of results) {
+    const rel = result.subpackageRel.replace(/\\/g, '/');
+    const staleNativePath = `native/${result.uuid.substring(0, 2)}/${result.originalFile}`;
+    const staleImportFileName = result.importOnly ? result.originalFile : `${result.uuid}.json`;
+    const staleImportPath = `import/${result.uuid.substring(0, 2)}/${staleImportFileName}`;
+    const needles = [
+      `${rel}/${staleNativePath}`,
+      staleNativePath,
+      `${rel}/${staleImportPath}`,
+      staleImportPath,
+      result.searchString,
+      result.uuid,
+    ].filter(Boolean);
+
+    for (const needle of needles) {
+      if (!needleSet.has(needle)) {
+        needleSet.add(needle);
+        allNeedles.push(needle);
+      }
+    }
+
+    checks.push({
+      result,
+      rel,
+      staleNativePath,
+      staleImportPath,
+      staleImportFileName,
+      needles,
+    });
+  }
+
+  return { checks, allNeedles };
+}
+
+function verifyPipelineResults(processedDir, results, options = {}) {
   let missingFiles = 0;
   const staleByUuid = new Map();
   const staleSamples = [];
@@ -1346,22 +1369,23 @@ function verifyPipelineResults(processedDir, results) {
     }
   }
 
-  function scanDir(dirPath) {
-    if (staleSamples.length >= 10 && staleByUuid.size >= results.length) return;
-    for (const item of fs.readdirSync(dirPath)) {
-      const itemPath = path.join(dirPath, item);
-      if (fs.lstatSync(itemPath).isDirectory()) {
-        scanDir(itemPath);
-        continue;
-      }
-      if (!FILE_EXTENSIONS.TEXT.includes(path.extname(itemPath).toLowerCase())) continue;
+  const { checks, allNeedles } = buildStaleCheckIndex(results);
+  const scanRoots = ['assets', 'subpackages']
+    .map((name) => path.join(processedDir, name))
+    .filter((dirPath) => fs.existsSync(dirPath));
 
-      const content = fs.readFileSync(itemPath, 'utf8');
-      const fileRel = path.relative(processedDir, itemPath);
-      for (const result of results) {
-        if (staleByUuid.has(result.uuid)) continue;
-        const rel = result.subpackageRel.replace(/\\/g, '/');
-        const staleNativePath = `native/${result.uuid.substring(0, 2)}/${result.originalFile}`;
+  for (const root of scanRoots) {
+    const files = collectTextFiles(root);
+    for (const filePath of files) {
+      const content = fs.readFileSync(filePath, 'utf8');
+      if (!contentMightMatch(content, allNeedles)) continue;
+
+      const fileRel = path.relative(processedDir, filePath);
+      for (const check of checks) {
+        if (staleByUuid.has(check.result.uuid)) continue;
+        if (!check.needles.some((needle) => content.includes(needle))) continue;
+
+        const { result, rel, staleNativePath, staleImportPath, staleImportFileName } = check;
         const staleFullPath = `${rel}/${staleNativePath}`;
         if (content.includes(staleFullPath)) {
           noteStale(result, fileRel, staleFullPath);
@@ -1371,10 +1395,6 @@ function verifyPipelineResults(processedDir, results) {
           noteStale(result, fileRel, staleNativePath);
           continue;
         }
-        const staleImportFileName = result.importOnly
-          ? result.originalFile
-          : `${result.uuid}.json`;
-        const staleImportPath = `import/${result.uuid.substring(0, 2)}/${staleImportFileName}`;
         const staleImportFullPath = `${rel}/${staleImportPath}`;
         if (content.includes(staleImportFullPath)) {
           noteStale(result, fileRel, staleImportFullPath);
@@ -1395,13 +1415,8 @@ function verifyPipelineResults(processedDir, results) {
     }
   }
 
-  try {
-    scanDir(processedDir);
-  } catch (err) {
-    console.warn(`[Verify] scan failed: ${err.message}`);
-  }
-
-  const packImportVerify = verifyBundlePackImportRefs(processedDir);
+  const importIndex = options.importIndex || buildImportUuidIndex(processedDir);
+  const packImportVerify = verifyBundlePackImportRefs(processedDir, importIndex);
   if (packImportVerify.missingPackImports) {
     missingFiles += packImportVerify.missingPackImports;
   }
@@ -1419,45 +1434,120 @@ function verifyPipelineResults(processedDir, results) {
   return { missingFiles, staleRefs, staleByUuid, staleSamples, packImportVerify };
 }
 
-async function ensureLegacyNativeMirrors(results) {
-  let mirrored = 0;
-  for (const item of results) {
-    if (!isValidOutputFile(item.newPath)) continue;
-    if (!item.originalPath || path.resolve(item.originalPath) === path.resolve(item.newPath)) continue;
-    if (isValidOutputFile(item.originalPath)) continue;
-    await ensureDirectoryExists(item.originalPath);
-    await fs.copy(item.newPath, item.originalPath);
-    mirrored++;
-    if (item.companionNative && !isValidOutputFile(item.companionNative.originalNativePath)) {
-      await ensureDirectoryExists(item.companionNative.originalNativePath);
-      await fs.copy(item.companionNative.newNativePath, item.companionNative.originalNativePath);
-      mirrored++;
-    }
-  }
-  if (mirrored) {
-    console.warn(`[Mirror] restored ${mirrored} legacy native path(s) from new copies`);
-  }
-  return mirrored;
-}
+async function cleanupLegacyDuplicates(results) {
+  const pathsToRemove = new Set();
 
-async function ensureLegacyImportMirrors(results) {
-  let mirrored = 0;
   for (const item of results) {
+    if (
+      item.newPath
+      && item.originalPath
+      && path.resolve(item.newPath) !== path.resolve(item.originalPath)
+      && isValidOutputFile(item.newPath)
+      && isValidOutputFile(item.originalPath)
+    ) {
+      pathsToRemove.add(path.resolve(item.originalPath));
+    }
+
     for (const mig of item.importMigrations || []) {
-      if (!isValidOutputFile(mig.newImportPath)) continue;
-      if (isValidOutputFile(mig.originalImportPath)) continue;
-      await ensureDirectoryExists(mig.originalImportPath);
-      await fs.copy(mig.newImportPath, mig.originalImportPath);
-      mirrored++;
+      if (
+        mig.newImportPath
+        && mig.originalImportPath
+        && path.resolve(mig.newImportPath) !== path.resolve(mig.originalImportPath)
+        && isValidOutputFile(mig.newImportPath)
+        && isValidOutputFile(mig.originalImportPath)
+      ) {
+        pathsToRemove.add(path.resolve(mig.originalImportPath));
+      }
+    }
+
+    if (item.companionNative) {
+      const { originalNativePath, newNativePath } = item.companionNative;
+      if (
+        originalNativePath
+        && newNativePath
+        && path.resolve(originalNativePath) !== path.resolve(newNativePath)
+        && isValidOutputFile(newNativePath)
+        && isValidOutputFile(originalNativePath)
+      ) {
+        pathsToRemove.add(path.resolve(originalNativePath));
+      }
     }
   }
-  if (mirrored) {
-    console.warn(`[Mirror] restored ${mirrored} legacy import path(s) from new copies`);
+
+  let removed = 0;
+  let freedBytes = 0;
+  for (const absPath of pathsToRemove) {
+    try {
+      if (!fs.existsSync(absPath)) continue;
+      freedBytes += fs.statSync(absPath).size;
+      await forceRemoveFile(absPath);
+      removed++;
+    } catch (err) {
+      console.warn(`[Cleanup] failed to remove ${path.basename(absPath)}: ${err.message}`);
+    }
   }
-  return mirrored;
+
+  if (removed) {
+    console.log(
+      `[Cleanup] removed ${removed} legacy duplicate file(s), freed ~${(freedBytes / 1024 / 1024).toFixed(1)} MB`,
+    );
+  }
+  return { removed, freedBytes };
 }
 
-function writePipelineAuditReport(appRoot, processedDir, results, verifyResult) {
+function pruneEmptyDirectories(rootDir) {
+  if (!fs.existsSync(rootDir)) return;
+  for (const entry of fs.readdirSync(rootDir)) {
+    const entryPath = path.join(rootDir, entry);
+    if (!fs.lstatSync(entryPath).isDirectory()) continue;
+    pruneEmptyDirectories(entryPath);
+    if (fs.readdirSync(entryPath).length === 0) fs.rmdirSync(entryPath);
+  }
+}
+
+function pruneBundleAssetDirs(processedDir) {
+  for (const base of ['assets', 'subpackages']) {
+    const basePath = path.join(processedDir, base);
+    if (!fs.existsSync(basePath)) continue;
+    for (const bundle of fs.readdirSync(basePath)) {
+      const bundlePath = path.join(basePath, bundle);
+      if (!fs.lstatSync(bundlePath).isDirectory()) continue;
+      for (const sub of ['native', 'import']) {
+        pruneEmptyDirectories(path.join(bundlePath, sub));
+      }
+    }
+  }
+}
+
+function countFilesRecursive(dirPath) {
+  if (!fs.existsSync(dirPath)) return 0;
+  let count = 0;
+  for (const entry of fs.readdirSync(dirPath)) {
+    const entryPath = path.join(dirPath, entry);
+    if (fs.lstatSync(entryPath).isDirectory()) {
+      count += countFilesRecursive(entryPath);
+    } else {
+      count++;
+    }
+  }
+  return count;
+}
+
+function verifyFileCountParity(sourceDir, processedDir) {
+  const sourceCount = countFilesRecursive(sourceDir);
+  const processedCount = countFilesRecursive(processedDir);
+  const ok = sourceCount === processedCount;
+  if (!ok) {
+    console.error(
+      `[Verify] file count mismatch: src=${sourceCount} processed=${processedCount} (delta=${processedCount - sourceCount})`,
+    );
+  } else {
+    console.log(`[Verify] file count OK: ${sourceCount} files`);
+  }
+  return { sourceCount, processedCount, ok };
+}
+
+function writePipelineAuditReport(appRoot, processedDir, results, verifyResult, extra = {}) {
   const reportPath = path.join(appRoot, 'post_process_audit.json');
   const staleUuids = [...(verifyResult.staleByUuid?.keys?.() || [])];
   const payload = {
@@ -1467,6 +1557,7 @@ function writePipelineAuditReport(appRoot, processedDir, results, verifyResult) 
     missingFiles: verifyResult.missingFiles,
     staleReferenceCount: verifyResult.staleRefs,
     staleUuids: staleUuids.slice(0, 50),
+    ...extra,
     hint: verifyResult.staleRefs || verifyResult.missingFiles
       ? '请用 src_processed 运行游戏；在 src_processed 内搜索 staleUuids 应无结果'
       : '校验通过，请使用 src_processed 目录作为构建产物运行',
@@ -1756,41 +1847,63 @@ async function main(options = {}) {
   }
 
   await recoverMissingNativeAssets(sourceDir, results);
-  await ensureLegacyNativeMirrors(results);
-  await ensureLegacyImportMirrors(results);
+  pruneBundleAssetDirs(processedDir);
 
   const replaceCommandsFile = path.join(appRoot, 'replace_commands_global.json');
-  fs.writeFileSync(replaceCommandsFile, JSON.stringify(globalReplaceCommands, null, 2));
+  fs.writeFileSync(replaceCommandsFile, JSON.stringify(globalReplaceCommands));
   step(4, `Saved ${globalReplaceCommands.length} replace commands`);
 
   console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Applying global UUID replacements...`);
-  applyReplaceCommands(processedDir, globalReplaceCommands);
-  await ensureCrossBundleImportMirrors(processedDir);
-  let verifyResult = verifyPipelineResults(processedDir, results);
+  await applyReplaceCommands(processedDir, globalReplaceCommands, { label: 'initial', onProgress });
+  let importIndex = buildImportUuidIndex(processedDir);
+  let verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
   if (verifyResult.staleRefs > 0) {
     console.warn('[Repair] stale references detected, retrying global replace...');
-    applyReplaceCommands(processedDir, globalReplaceCommands);
-    await ensureCrossBundleImportMirrors(processedDir);
-    verifyResult = verifyPipelineResults(processedDir, results);
+    await applyReplaceCommands(processedDir, globalReplaceCommands, { label: 'stale-retry', onProgress });
+    importIndex = buildImportUuidIndex(processedDir);
+    verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
   }
 
-  writePipelineAuditReport(appRoot, processedDir, results, verifyResult);
+  let cleanupResult = { removed: 0, freedBytes: 0 };
+  if (!verifyResult.staleRefs && !verifyResult.missingFiles) {
+    cleanupResult = await cleanupLegacyDuplicates(results);
+    if (cleanupResult.removed) {
+      pruneBundleAssetDirs(processedDir);
+      importIndex = buildImportUuidIndex(processedDir);
+      verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+      console.log(`[Cleanup] removed ${cleanupResult.removed} leftover duplicate(s), verify stale=${verifyResult.staleRefs}`);
+    }
+  }
+
+  const fileCountVerify = verifyFileCountParity(sourceDir, processedDir);
+
+  writePipelineAuditReport(appRoot, processedDir, results, verifyResult, {
+    legacyDuplicatesRemoved: cleanupResult.removed,
+    legacyDuplicatesFreedBytes: cleanupResult.freedBytes,
+    fileCount: fileCountVerify,
+  });
 
   step(5, 'Obfuscating bundle JavaScript (parallel)...');
+  const obfuscatedJs = collectObfuscateTargets(subpackagesDir, assetsDir);
   await obfuscateAllBundles(subpackagesDir, assetsDir);
 
   if (globalReplaceCommands.length) {
     console.log('[Repair] post-obfuscation UUID replace pass...');
-    applyReplaceCommands(processedDir, globalReplaceCommands);
-    await ensureCrossBundleImportMirrors(processedDir);
-    verifyResult = verifyPipelineResults(processedDir, results);
-    writePipelineAuditReport(appRoot, processedDir, results, verifyResult);
+    await applyReplaceCommands(processedDir, globalReplaceCommands, {
+      label: 'post-obfuscation',
+      jsOnly: true,
+      files: obfuscatedJs,
+      onProgress,
+    });
+    importIndex = buildImportUuidIndex(processedDir);
+    verifyResult = verifyPipelineResults(processedDir, results, { importIndex });
+    writePipelineAuditReport(appRoot, processedDir, results, verifyResult, { fileCount: fileCountVerify });
   }
 
   console.log(`\nSummary: ${results.length} assets processed, ${globalReplaceCommands.length} replacements`);
-  if (verifyResult.staleRefs || verifyResult.missingFiles) {
+  if (verifyResult.staleRefs || verifyResult.missingFiles || !fileCountVerify.ok) {
     console.error(
-      `[Summary] verify FAILED: stale=${verifyResult.staleRefs} missing=${verifyResult.missingFiles}. 请用 src_processed 运行，并查看 post_process_audit.json`,
+      `[Summary] verify FAILED: stale=${verifyResult.staleRefs} missing=${verifyResult.missingFiles} fileCount=${fileCountVerify.ok ? 'OK' : fileCountVerify.processedCount - fileCountVerify.sourceCount}. 请用 src_processed 运行，并查看 post_process_audit.json`,
     );
   } else {
     console.log('[Summary] verify OK — 请使用 src_processed 目录运行游戏');
