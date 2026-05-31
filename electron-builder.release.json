@@ -36,6 +36,10 @@
     {
       "from": "public.key",
       "to": "."
+    },
+    {
+      "from": "milfun.config.example.json",
+      "to": "milfun.config.example.json"
     }
   ],
   "win": {

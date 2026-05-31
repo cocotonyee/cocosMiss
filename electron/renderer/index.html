@@ -19,17 +19,33 @@
     <header class="header">
       <span class="app-title">MilFun</span>
       <div class="header-actions">
-        <span id="license-badge" class="auth-dot" title="检查授权中..."></span>
+        <span id="license-badge" class="auth-dot" title="Checking license..."></span>
         <div class="settings-wrap">
           <button id="btn-settings" class="btn-icon" title="设置">⚙</button>
           <div id="settings-popover" class="settings-popover hidden">
-            <button id="btn-import-license" class="popover-item">导入许可证</button>
-            <button id="btn-fingerprint" class="popover-item">复制指纹</button>
+            <div class="popover-section">
+              <div class="popover-label">功能开关</div>
+              <label class="toggle-row">
+                <span>JS 混淆</span>
+                <input type="checkbox" id="cfg-obfuscation" checked />
+              </label>
+              <label class="toggle-row">
+                <span>图片重哈希</span>
+                <input type="checkbox" id="cfg-image" checked />
+              </label>
+              <label class="toggle-row">
+                <span>音频处理</span>
+                <input type="checkbox" id="cfg-audio" checked />
+              </label>
+            </div>
+            <div class="popover-divider"></div>
+            <button id="btn-import-license" class="popover-item">Import License</button>
+            <button id="btn-fingerprint" class="popover-item">Copy Fingerprint</button>
           </div>
         </div>
       </div>
     </header>
-    <p id="license-text" class="license-text">检查授权中...</p>
+    <p id="license-text" class="license-text">Checking license...</p>
 
     <section class="source-block">
       <div class="row-head">

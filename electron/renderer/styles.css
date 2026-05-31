@@ -149,11 +149,28 @@ body {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  min-width: 120px;
+  min-width: 168px;
   background: var(--surface);
   border: 1px solid var(--border);
-  padding: 2px;
+  padding: 4px 2px;
   z-index: 100;
+}
+
+.popover-section {
+  padding: 2px 4px 4px;
+}
+
+.popover-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  padding: 4px 8px 2px;
+  letter-spacing: 0.3px;
+}
+
+.popover-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 6px;
 }
 
 .settings-popover.hidden {
@@ -230,6 +247,37 @@ body {
 
 .btn-text:disabled {
   opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 5px 8px;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 2px;
+}
+
+.toggle-row:hover {
+  background: #1c1c1c;
+  color: var(--text);
+}
+
+.toggle-row input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--green);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.toggle-row:has(input:disabled) {
+  opacity: 0.35;
   cursor: not-allowed;
 }
 

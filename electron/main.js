@@ -4,6 +4,7 @@ const fs = require('fs');
 const fse = require('fs-extra');
 const { ensureDependencies, getProjectRoot } = require('./deps');
 const licenseService = require('../license-service');
+const userConfig = require('../config');
 const { resolveCoreRoot } = require('./worker-path');
 const { loadCore } = require('./load-core');
 
@@ -164,6 +165,7 @@ function setupCoreEnv() {
   process.env.MILFUN_APP_ROOT = getResourcesRoot();
   process.env.MILFUN_EXE_DIR = getExeDir();
   process.env.MILFUN_LICENSE_DIR = getLicenseDir();
+  process.env.MILFUN_WORKSPACE = getWorkspaceDir();
 }
 
 function getAppRoot() {
@@ -191,6 +193,7 @@ function getWorkerEnv() {
     MILFUN_EXE_DIR: getExeDir(),
     MILFUN_LICENSE_DIR: getLicenseDir(),
     MILFUN_CORE_ROOT: coreRoot,
+    MILFUN_WORKSPACE: getWorkspaceDir(),
     NODE_PATH: nodePath,
   };
 }
@@ -221,6 +224,7 @@ async function runPipelineInMain(options) {
     processedDir: options.processedDir,
     outputDir: options.outputDir,
     licenseRoot: getResourcesRoot(),
+    featureFlags: options.featureFlags,
     trustUiLicense: true,
     onLog: (level, message) => logLine(level, message),
     onProgress: (step, total, message) => {
@@ -315,6 +319,22 @@ ipcMain.handle('get-app-info', async () => ({
   depsReady,
 }));
 
+ipcMain.handle('get-feature-config', async () => {
+  setupCoreEnv();
+  return userConfig.getFeatureConfigForUi();
+});
+
+ipcMain.handle('save-feature-config', async (_event, flags) => {
+  setupCoreEnv();
+  const saved = userConfig.saveFeatureFlags(flags || {});
+  return {
+    canObfuscation: saved.CAN_OBFUSCATION,
+    canImageSwitch: saved.CAN_IMAGE_SWITCH,
+    canAudioSwitch: saved.CAN_AUDIO_SWITCH,
+    configPath: saved.configPath || userConfig.getWritableConfigPath(),
+  };
+});
+
 ipcMain.handle('check-license', async (_event, options = {}) => {
   if (!depsReady) return { valid: false, reason: '依赖尚未就绪' };
   try {
@@ -334,7 +354,7 @@ ipcMain.handle('get-fingerprint', async () => {
 ipcMain.handle('import-license', async () => {
   if (!depsReady) return { ok: false, error: '依赖尚未就绪' };
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '导入许可证文件',
+    title: 'Import License File',
     properties: ['openFile'],
     filters: [{ name: 'License', extensions: ['lic'] }],
     defaultPath: getLicenseDir(),
@@ -365,7 +385,7 @@ ipcMain.handle('open-path', async (_event, targetPath) => {
   return true;
 });
 
-ipcMain.handle('start-processing', async (_event, sourceDir) => {
+ipcMain.handle('start-processing', async (_event, payload) => {
   if (!depsReady) {
     return { ok: false, error: '依赖尚未就绪，请等待 npm install 完成' };
   }
@@ -373,6 +393,8 @@ ipcMain.handle('start-processing', async (_event, sourceDir) => {
     return { ok: false, error: '正在处理中，请稍候...' };
   }
 
+  const sourceDir = typeof payload === 'string' ? payload : payload?.sourceDir;
+  const featureFlags = typeof payload === 'object' ? payload?.featureFlags : undefined;
   const resolvedSource = sourceDir || getDefaultSourceDir();
   if (!fs.existsSync(resolvedSource)) {
     return { ok: false, error: `源码目录不存在: ${resolvedSource}` };
@@ -384,6 +406,10 @@ ipcMain.handle('start-processing', async (_event, sourceDir) => {
   send('log', { level: 'info', message: 'MilFun Start...' });
 
   try {
+    if (featureFlags) {
+      setupCoreEnv();
+      userConfig.saveFeatureFlags(featureFlags);
+    }
     const stagedSource = await stageSourceToWorkspace(resolvedSource);
     const workspace = getWorkspaceDir();
     return await runPipelineInMain({
@@ -391,6 +417,7 @@ ipcMain.handle('start-processing', async (_event, sourceDir) => {
       sourceDir: stagedSource,
       processedDir: path.join(workspace, 'src_processed'),
       outputDir: workspace,
+      featureFlags,
     });
   } catch (error) {
     const message = error.message || String(error);

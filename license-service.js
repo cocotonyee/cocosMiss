@@ -27,23 +27,23 @@ class LicenseValidator {
 
   validateLicense(license, deviceFingerprint = null) {
     if (!this.publicKey) {
-      throw new Error('未设置公钥，无法验证许可证');
+      throw new Error('Public key not set, cannot validate license');
     }
 
     const licenseDataStr = JSON.stringify(license.data);
     if (!this.verifySignature(licenseDataStr, license.signature, this.publicKey)) {
-      return { valid: false, reason: '许可证签名无效' };
+      return { valid: false, reason: 'Invalid license signature' };
     }
 
     const licenseData = license.data;
     if (new Date(licenseData.expiryDate) < new Date()) {
-      return { valid: false, reason: '许可证已过期', expiryDate: licenseData.expiryDate };
+      return { valid: false, reason: 'License expired', expiryDate: licenseData.expiryDate };
     }
 
     if (deviceFingerprint && licenseData.deviceFingerprint !== deviceFingerprint) {
       return {
         valid: false,
-        reason: '设备不匹配',
+        reason: 'Device mismatch',
         expected: licenseData.deviceFingerprint,
         actual: deviceFingerprint,
       };
@@ -61,19 +61,19 @@ class LicenseValidator {
 
   validateLicenseFile(licensePath, deviceFingerprint = null) {
     if (!fs.existsSync(licensePath)) {
-      return { valid: false, reason: '许可证文件不存在' };
+      return { valid: false, reason: 'License file not found' };
     }
     try {
       const license = JSON.parse(fs.readFileSync(licensePath, 'utf8'));
       return this.validateLicense(license, deviceFingerprint);
     } catch (error) {
-      return { valid: false, reason: `许可证文件格式错误: ${error.message}` };
+      return { valid: false, reason: `Invalid license file format: ${error.message}` };
     }
   }
 
   async fullValidation(licensePath, publicKeyPath = 'public.key') {
     if (!fs.existsSync(publicKeyPath)) {
-      return { valid: false, reason: '公钥文件不存在' };
+      return { valid: false, reason: 'Public key file not found' };
     }
     this.setPublicKey(fs.readFileSync(publicKeyPath, 'utf8'));
     const fingerprint = await getDeviceFingerprint();
@@ -151,7 +151,7 @@ async function getDeviceFingerprint() {
 
 async function importLicense(sourceFile, appRoot) {
   if (!fs.existsSync(sourceFile)) {
-    throw new Error('许可证文件不存在');
+    throw new Error('License file not found');
   }
   const targetDir = getLicenseStorageDir();
   await fs.mkdir(targetDir, { recursive: true });
@@ -165,12 +165,12 @@ async function checkLicense(appRoot, options = {}) {
   const licensePath = resolveLicensePath(appRoot);
 
   if (!fs.existsSync(publicKeyPath)) {
-    return { valid: false, reason: '缺少 public.key', publicKeyPath, licensePath };
+    return { valid: false, reason: 'Missing public.key', publicKeyPath, licensePath };
   }
   if (!fs.existsSync(licensePath)) {
     return {
       valid: false,
-      reason: '缺少 license.lic，请导入许可证或联系服务商',
+      reason: 'Missing license.lic — import a license or contact vendor',
       publicKeyPath,
       licensePath,
       licenseDir: getLicenseStorageDir(),

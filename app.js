@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 
 let _sharp;
 function getSharp() {
@@ -44,10 +44,10 @@ const {
   FILE_EXTENSIONS,
   OBFUSCATION_CONFIG,
   OBFUSCATION_PRESETS,
-  CAN_OBFUSCATION,
   WHITELIST_CONFIG,
-  CAN_IMAGE_SWITCH,
-  CAN_AUDIO_SWITCH,
+  getFeatureFlags,
+  refreshFeatureFlags,
+  applyFeatureFlags,
 } = require('./config');
 
 const {
@@ -217,21 +217,54 @@ async function removeFileWithRetry(filePath, retries = 8, delayMs = 150) {
   let lastErr;
   for (let i = 0; i < retries; i++) {
     try {
+      try {
+        fs.chmodSync(filePath, 0o666);
+      } catch (_) { /* ignore */ }
       await fs.promises.rm(filePath, { force: true, maxRetries: 3, retryDelay: 100 });
       return;
     } catch (err) {
       lastErr = err;
       if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'EBUSY')) {
         await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
-        try {
-          fs.chmodSync(filePath, 0o666);
-        } catch (_) { /* ignore */ }
         continue;
       }
       throw err;
     }
   }
   throw lastErr;
+}
+
+function forceRemoveFileSync(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  if (process.platform === 'win32') {
+    execSync(`cmd /c attrib -R "${filePath}" & del /f /q "${filePath}"`, { stdio: 'ignore', windowsHide: true });
+    if (!fs.existsSync(filePath)) return;
+  }
+  fs.rmSync(filePath, { force: true, maxRetries: 5, retryDelay: 200 });
+}
+
+async function forceRemoveFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  try {
+    await removeFileWithRetry(filePath, 12, 250);
+    if (!fs.existsSync(filePath)) return;
+  } catch (_) { /* retry below */ }
+
+  await new Promise((resolve, reject) => {
+    if (process.platform === 'win32') {
+      exec(`cmd /c attrib -R "${filePath}" & del /f /q "${filePath}"`, { windowsHide: true }, (err) => {
+        if (fs.existsSync(filePath)) reject(err || new Error(`无法删除: ${path.basename(filePath)}`));
+        else resolve();
+      });
+      return;
+    }
+    try {
+      forceRemoveFileSync(filePath);
+      resolve();
+    } catch (err) {
+      reject(err);
+    }
+  });
 }
 
 async function runWithConcurrency(items, worker, limit = 4) {
@@ -321,7 +354,7 @@ async function rehashImage(inputPath, outputPath) {
   const ext = path.extname(inputPath).toLowerCase();
   let pipeline = getSharp()(inputPath);
 
-  if (CAN_IMAGE_SWITCH) {
+  if (getFeatureFlags().CAN_IMAGE_SWITCH) {
     const compressionLevel = crypto.randomInt(0, 10);
     if (ext === '.png') {
       pipeline = pipeline.png({ compressionLevel, adaptiveFiltering: true });
@@ -335,33 +368,41 @@ async function rehashImage(inputPath, outputPath) {
   await fs.writeFile(outputPath, buffer);
 }
 
+async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
+  const tempPath = `${outputPath}.milfun-${process.pid}-${Date.now()}.tmp`;
+  try {
+    if (FILE_EXTENSIONS.IMAGE.includes(fileExt)) {
+      if (getFeatureFlags().CAN_IMAGE_SWITCH) {
+        await rehashImage(inputPath, tempPath);
+      } else {
+        await fs.copy(inputPath, tempPath);
+      }
+    } else if (getFeatureFlags().CAN_AUDIO_SWITCH && FILE_EXTENSIONS.AUDIO.includes(fileExt)) {
+      await processAudioFile(inputPath, tempPath, 'medium');
+    } else {
+      await fs.copy(inputPath, tempPath);
+    }
+
+    if (fs.existsSync(outputPath)) await forceRemoveFile(outputPath);
+    await fs.rename(tempPath, outputPath);
+  } catch (err) {
+    await forceRemoveFile(tempPath).catch(() => {});
+    if (!fs.existsSync(outputPath)) {
+      await fs.copy(inputPath, outputPath);
+      return;
+    }
+    throw err;
+  }
+}
+
 async function moveNativeFile(inputPath, outputPath, fileExt) {
   if (path.resolve(inputPath) === path.resolve(outputPath)) return;
 
   await ensureDirectoryExists(outputPath);
-  try {
-    if (FILE_EXTENSIONS.IMAGE.includes(fileExt)) {
-      if (CAN_IMAGE_SWITCH) {
-        await rehashImage(inputPath, outputPath);
-      } else {
-        await fs.copy(inputPath, outputPath);
-      }
-    } else if (CAN_AUDIO_SWITCH && FILE_EXTENSIONS.AUDIO.includes(fileExt)) {
-      await processAudioFile(inputPath, outputPath, 'medium');
-    } else {
-      await fs.copy(inputPath, outputPath);
-    }
-    await removeFileWithRetry(inputPath);
-  } catch (err) {
-    console.warn(`Native file process failed, fallback copy: ${inputPath} → ${err.message}`);
-    if (!fs.existsSync(outputPath)) {
-      await fs.copy(inputPath, outputPath);
-    }
-    try {
-      await removeFileWithRetry(inputPath);
-    } catch (unlinkErr) {
-      console.warn(`Could not remove source file (safe to ignore): ${path.basename(inputPath)} → ${unlinkErr.message}`);
-    }
+  await writeProcessedNativeFile(inputPath, outputPath, fileExt);
+
+  if (path.resolve(inputPath) !== path.resolve(outputPath)) {
+    await forceRemoveFile(inputPath);
   }
 }
 
@@ -497,7 +538,7 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
   await runWithConcurrency(
     tasks,
     (task) => processOneAsset(task.subpackageDir, task.currentNativeSubDir, task.file, globalReplaceCommands, results),
-    4,
+    process.platform === 'win32' ? 1 : 4,
   );
   for (const subDirPath of nativeSubDirs) removeEmptyDir(subDirPath);
   console.log(`[Bundle] ${subpackageName} done (${tasks.length} assets)`);
@@ -506,7 +547,7 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
 // ─── JS 混淆（三档 + 体积保护）──────────────────────────────
 
 function obfuscateJavaScript(filePath) {
-  if (!fs.existsSync(filePath) || !CAN_OBFUSCATION) return;
+  if (!fs.existsSync(filePath) || !getFeatureFlags().CAN_OBFUSCATION) return;
   if (isInWhitelist(filePath)) {
     console.log(`Skip obfuscation (whitelist): ${path.basename(filePath)}`);
     return;
@@ -648,12 +689,26 @@ async function runPipeline(options = {}) {
   const hooks = installLogHooks(options.onLog);
   try {
     if (!options.trustUiLicense) {
-      options.onProgress?.(0, PIPELINE_STEPS, '正在验证授权...');
+      options.onProgress?.(0, PIPELINE_STEPS, 'Verifying license...');
       const license = await checkLicense(licenseRoot, {});
-      if (!license.valid) throw new Error(license.reason || '许可证无效');
+      if (!license.valid) throw new Error(license.reason || 'Invalid license');
     }
 
     options.onProgress?.(0, PIPELINE_STEPS, '开始处理...');
+    if (options.featureFlags) {
+      applyFeatureFlags(options.featureFlags);
+      console.log(
+        `[Config] 界面开关: 混淆=${options.featureFlags.canObfuscation} 图片=${options.featureFlags.canImageSwitch} 音频=${options.featureFlags.canAudioSwitch}`,
+      );
+    } else {
+      const flags = refreshFeatureFlags();
+      if (flags.configPath) {
+        console.log(`[Config] 已加载: ${flags.configPath}`);
+        console.log(`[Config] 混淆=${flags.CAN_OBFUSCATION} 图片=${flags.CAN_IMAGE_SWITCH} 音频=${flags.CAN_AUDIO_SWITCH}`);
+      } else {
+        console.log('[Config] 未找到 milfun.config.json，使用默认开关');
+      }
+    }
     const processedDir = await main({ ...options, appRoot });
     options.onProgress?.(PIPELINE_STEPS, PIPELINE_STEPS, '处理完成');
     console.log('\x1b[37m\x1b[44m %s \x1b[0m\x1b[37m\x1b[42m %s \x1b[0m', 'MilFun', 'Well Done!');
@@ -684,9 +739,9 @@ class ProtectedApplication {
 
     const result = await checkLicense(this.appRoot);
     if (!result.valid) {
-      console.error('应用程序启动失败:', result.reason);
-      if (result.reason === '设备不匹配') {
-        console.log('\n检测到设备变更，请将以下指纹发送给软件提供商:');
+      console.error('Startup failed:', result.reason);
+      if (result.reason === 'Device mismatch') {
+        console.log('\nDevice changed. Send this fingerprint to your vendor:');
         console.log(await getDeviceFingerprint());
       }
       process.exit(1);

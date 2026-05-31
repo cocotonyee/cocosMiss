@@ -7,6 +7,9 @@ const settingsPopover = document.getElementById('settings-popover');
 const btnImportLicense = document.getElementById('btn-import-license');
 const btnFingerprint = document.getElementById('btn-fingerprint');
 const btnStart = document.getElementById('btn-start');
+const cfgObfuscation = document.getElementById('cfg-obfuscation');
+const cfgImage = document.getElementById('cfg-image');
+const cfgAudio = document.getElementById('cfg-audio');
 const logOutput = document.getElementById('log-output');
 const progressFill = document.getElementById('progress-fill');
 const progressPercent = document.getElementById('progress-percent');
@@ -18,6 +21,7 @@ let processedDir = '';
 let licenseValid = false;
 let isProcessing = false;
 let appReady = false;
+let saveConfigTimer = null;
 
 function shortPath(p) {
   if (!p) return './src';
@@ -50,21 +54,61 @@ function setProgress(step, total) {
 
 function setLicenseBadge(result) {
   if (result.valid) {
-    const expiry = new Date(result.expiryDate).toLocaleDateString('zh-CN');
+    const expiry = new Date(result.expiryDate).toLocaleDateString('en-US');
     licenseBadge.className = 'auth-dot ok';
-    licenseBadge.title = `已授权，到期 ${expiry}`;
-    licenseText.textContent = `已授权 · ${expiry} 到期`;
+    licenseBadge.title = `Licensed, expires ${expiry}`;
+    licenseText.textContent = `Licensed · ${expiry}`;
     licenseText.className = 'license-text ok';
     licenseValid = true;
     btnStart.disabled = isProcessing || !appReady;
   } else {
     licenseBadge.className = 'auth-dot error';
-    licenseBadge.title = result.reason || '未授权';
-    licenseText.textContent = '未授权 · ⚙ 导入许可证';
+    licenseBadge.title = result.reason || 'Not licensed';
+    licenseText.textContent = 'Not licensed · ⚙ Import';
     licenseText.className = 'license-text error';
     licenseValid = false;
     btnStart.disabled = true;
   }
+}
+
+function getFeatureFlagsFromUi() {
+  return {
+    canObfuscation: cfgObfuscation.checked,
+    canImageSwitch: cfgImage.checked,
+    canAudioSwitch: cfgAudio.checked,
+  };
+}
+
+function applyFeatureFlagsToUi(flags) {
+  cfgObfuscation.checked = Boolean(flags.canObfuscation);
+  cfgImage.checked = Boolean(flags.canImageSwitch);
+  cfgAudio.checked = Boolean(flags.canAudioSwitch);
+}
+
+function setFeatureControlsDisabled(disabled) {
+  cfgObfuscation.disabled = disabled;
+  cfgImage.disabled = disabled;
+  cfgAudio.disabled = disabled;
+}
+
+async function loadFeatureConfig() {
+  try {
+    const flags = await window.milfun.getFeatureConfig();
+    applyFeatureFlagsToUi(flags);
+  } catch (err) {
+    appendLog('warn', `读取配置失败: ${err.message}`);
+  }
+}
+
+function scheduleSaveFeatureConfig() {
+  if (saveConfigTimer) clearTimeout(saveConfigTimer);
+  saveConfigTimer = setTimeout(async () => {
+    try {
+      await window.milfun.saveFeatureConfig(getFeatureFlagsFromUi());
+    } catch (err) {
+      appendLog('warn', `保存配置失败: ${err.message}`);
+    }
+  }, 300);
 }
 
 function toggleSettingsPopover(force) {
@@ -104,6 +148,7 @@ function bindEvents() {
     btnSettings.disabled = running;
     btnFingerprint.disabled = running;
     btnImportLicense.disabled = running;
+    setFeatureControlsDisabled(running);
     if (running) closeSettingsPopover();
   });
 
@@ -116,6 +161,12 @@ function bindEvents() {
   window.milfun.onError(({ message }) => {
     appendLog('error', message);
     setProgress(0, 5);
+  });
+
+  [cfgObfuscation, cfgImage, cfgAudio].forEach((input) => {
+    input.addEventListener('change', () => {
+      if (!isProcessing) scheduleSaveFeatureConfig();
+    });
   });
 
   document.addEventListener('click', (e) => {
@@ -140,11 +191,11 @@ function bindEvents() {
     const result = await window.milfun.importLicense();
     if (result.canceled) return;
     if (result.ok) {
-      appendLog('success', '许可证导入成功');
+      appendLog('success', 'License imported');
       setLicenseBadge(result.license);
     } else {
-      appendLog('error', result.license?.reason || '许可证无效');
-      setLicenseBadge(result.license || { valid: false, reason: '许可证无效' });
+      appendLog('error', result.license?.reason || 'Invalid license');
+      setLicenseBadge(result.license || { valid: false, reason: 'Invalid license' });
     }
   });
 
@@ -153,7 +204,7 @@ function bindEvents() {
     try {
       const fp = await window.milfun.getFingerprint();
       await navigator.clipboard.writeText(fp);
-      appendLog('success', '设备指纹已复制');
+      appendLog('success', 'Fingerprint copied');
     } catch (err) {
       appendLog('error', '复制失败: ' + err.message);
     }
@@ -164,7 +215,8 @@ function bindEvents() {
     processedDir = '';
     setProgress(0, 5);
     appendLog('info', 'MilFun Start...');
-    const result = await window.milfun.startProcessing(sourcePath);
+    const featureFlags = getFeatureFlagsFromUi();
+    const result = await window.milfun.startProcessing({ sourceDir: sourcePath, featureFlags });
     if (!result.ok) {
       appendLog('error', result.error);
       setProgress(0, 5);
@@ -178,6 +230,7 @@ async function initApp() {
   sourcePath = info.defaultSource;
   sourceDisplay.textContent = shortPath(sourcePath);
   appReady = info.depsReady;
+  await loadFeatureConfig();
   await refreshLicense();
 }
 

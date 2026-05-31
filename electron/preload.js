@@ -6,7 +6,9 @@ contextBridge.exposeInMainWorld('milfun', {
   getFingerprint: () => ipcRenderer.invoke('get-fingerprint'),
   importLicense: () => ipcRenderer.invoke('import-license'),
   selectSourceDir: () => ipcRenderer.invoke('select-source-dir'),
-  startProcessing: (sourceDir) => ipcRenderer.invoke('start-processing', sourceDir),
+  getFeatureConfig: () => ipcRenderer.invoke('get-feature-config'),
+  saveFeatureConfig: (flags) => ipcRenderer.invoke('save-feature-config', flags),
+  startProcessing: (payload) => ipcRenderer.invoke('start-processing', payload),
   openPath: (targetPath) => ipcRenderer.invoke('open-path', targetPath),
   onSetupStart: (callback) => {
     const handler = (_event, data) => callback(data);
