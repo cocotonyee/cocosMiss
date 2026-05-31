@@ -96,53 +96,70 @@ function restoreLogHooks(orig) {
 
 // ─── 音频 ───────────────────────────────────────────────────
 
+function resolveAudioExtension(filePath) {
+  let base = path.basename(filePath);
+  base = base.replace(/\.milfun-\d+-\d+(?:-compressed)?\.tmp$/i, '').replace(/\.tmp$/i, '');
+  const ext = path.extname(base).toLowerCase();
+  return FILE_EXTENSIONS.AUDIO.includes(ext) ? ext : '.mp3';
+}
+
 function checkFFmpeg() {
   return new Promise((resolve) => {
     exec('ffmpeg -version', (error) => resolve(!error));
   });
 }
 
-function compressAudioFile(inputPath, outputPath, quality = 'medium') {
+function compressAudioFile(inputPath, outputPath, quality = 'medium', audioExt) {
   return new Promise((resolve, reject) => {
     let bitrate = '128k';
     if (quality === 'low') bitrate = '192k';
     if (quality === 'high') bitrate = '64k';
 
-    const outputExtension = path.extname(outputPath).toLowerCase();
-    let codec = 'mp3';
-    if (outputExtension === '.aac') codec = 'aac';
-    else if (outputExtension === '.wav') codec = 'pcm_s16le';
+    const ext = audioExt || resolveAudioExtension(outputPath || inputPath);
+    let codecArgs = '-c:a libmp3lame';
+    if (ext === '.aac' || ext === '.m4a') codecArgs = '-c:a aac';
+    else if (ext === '.wav') codecArgs = '-c:a pcm_s16le';
+    else if (ext === '.ogg') codecArgs = '-c:a libvorbis';
+    else if (ext === '.opus') codecArgs = '-c:a libopus';
 
-    const command = `ffmpeg -y -i "${inputPath}" -b:a ${bitrate} -acodec ${codec} "${outputPath}"`;
-    exec(command, (error, _stdout, stderr) => {
-      if (error) reject(new Error(`FFmpeg error: ${stderr}`));
-      else resolve(outputPath);
+    const command = `ffmpeg -y -hide_banner -loglevel error -i "${inputPath}" -b:a ${bitrate} ${codecArgs} "${outputPath}"`;
+    exec(command, { windowsHide: true }, (error, _stdout, stderr) => {
+      if (error) {
+        const brief = (stderr || error.message || '').trim().split('\n').filter(Boolean).pop() || 'unknown error';
+        reject(new Error(brief));
+      } else resolve(outputPath);
     });
   });
 }
 
 async function processAudioFile(inputPath, outputPath, quality = 'medium') {
   await ensureDirectoryExists(outputPath);
-  await fs.copy(inputPath, outputPath);
-
-  const originalSize = fs.statSync(outputPath).size;
+  const audioExt = resolveAudioExtension(inputPath);
   const hasFFmpeg = await checkFFmpeg();
+
   if (!hasFFmpeg || quality === 'none') {
+    await fs.copy(inputPath, outputPath);
     console.log(`Audio copied (no FFmpeg): ${path.basename(outputPath)}`);
     return;
   }
 
-  const compressedPath = outputPath.replace(/(\.[\w\d_-]+)$/i, '_compressed$1');
+  const compressedPath = path.join(
+    path.dirname(outputPath),
+    `.milfun-${process.pid}-${Date.now()}${audioExt}`,
+  );
+
   try {
-    await compressAudioFile(outputPath, compressedPath, quality);
+    const originalSize = fs.statSync(inputPath).size;
+    await compressAudioFile(inputPath, compressedPath, quality, audioExt);
     const compressedSize = fs.statSync(compressedPath).size;
-    await removeFileWithRetry(outputPath);
-    fs.renameSync(compressedPath, outputPath);
+    if (fs.existsSync(outputPath)) await removeFileWithRetry(outputPath);
+    await fs.rename(compressedPath, outputPath);
     console.log(
       `Audio compressed: ${path.basename(outputPath)} (${((1 - compressedSize / originalSize) * 100).toFixed(1)}% saved)`
     );
   } catch (err) {
-    if (fs.existsSync(compressedPath)) await removeFileWithRetry(compressedPath).catch(() => {});
+    await forceRemoveFile(compressedPath).catch(() => {});
+    if (!fs.existsSync(outputPath)) await fs.copy(inputPath, outputPath);
     console.warn(`Audio compress failed, kept copy: ${err.message}`);
   }
 }
