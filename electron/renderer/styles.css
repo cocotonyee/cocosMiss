@@ -15,6 +15,12 @@
   --accent: #ccc;
   --green: #6fcf6f;
   --red: #e06060;
+  --progress-accent: #6fcf6f;
+  --progress-accent-dim: #4a6a4a;
+  --progress-accent-soft: rgba(111, 207, 111, 0.15);
+  --progress-accent-glow: rgba(111, 207, 111, 0.55);
+  --progress-border: #3a4a3a;
+  --progress-border-glow: #5a8a5a;
   --mono: 'Consolas', 'SF Mono', 'Menlo', 'PingFang SC', monospace;
 }
 
@@ -362,8 +368,8 @@ body {
 .btn-start.processing:disabled {
   opacity: 1;
   cursor: wait;
-  border-color: var(--green);
-  color: var(--green);
+  border-color: var(--progress-accent);
+  color: var(--progress-accent);
   animation: btn-processing-pulse 1.6s ease-in-out infinite;
 }
 
@@ -458,13 +464,13 @@ body {
 }
 
 .progress-track.processing {
-  border-color: #3d5c3d;
+  border-color: var(--progress-border);
   animation: track-glow 1.8s ease-in-out infinite;
 }
 
 @keyframes track-glow {
-  0%, 100% { border-color: #3a4a3a; }
-  50% { border-color: #5a8a5a; }
+  0%, 100% { border-color: var(--progress-border); }
+  50% { border-color: var(--progress-border-glow); }
 }
 
 .progress-fill {
@@ -476,12 +482,12 @@ body {
   overflow: hidden;
 }
 
-.progress-fill.active {
-  background: var(--text-dim);
+.progress-fill.active:not(.processing) {
+  background: var(--progress-accent);
 }
 
 .progress-fill.processing {
-  background: #4a6a4a;
+  background: var(--progress-accent-dim);
 }
 
 .progress-fill.processing::after {
@@ -491,9 +497,9 @@ body {
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(111, 207, 111, 0.15) 35%,
-    rgba(111, 207, 111, 0.55) 50%,
-    rgba(111, 207, 111, 0.15) 65%,
+    var(--progress-accent-soft) 35%,
+    var(--progress-accent-glow) 50%,
+    var(--progress-accent-soft) 65%,
     transparent 100%
   );
   animation: progress-shimmer 1.2s linear infinite;
@@ -506,7 +512,7 @@ body {
 
 .processing-status {
   font-size: 8px;
-  color: var(--green);
+  color: var(--progress-accent);
   line-height: 1.2;
   white-space: nowrap;
   overflow: hidden;
@@ -520,7 +526,7 @@ body {
 
 .progress-spinner {
   font-size: 11px;
-  color: var(--green);
+  color: var(--progress-accent);
   line-height: 1;
   min-width: 12px;
   text-align: center;
@@ -542,5 +548,5 @@ body {
 }
 
 .app.is-processing .log-box {
-  border-color: #3a4a3a;
+  border-color: var(--progress-border);
 }

@@ -43,6 +43,16 @@
                 <span>图片改色</span>
                 <input type="checkbox" id="cfg-image" checked />
               </label>
+              <div class="ratio-rows" id="image-intensity-rows">
+                <div class="slider-row">
+                  <div class="slider-head">
+                    <span>改色强度</span>
+                    <span id="cfg-image-intensity-val" class="slider-val">5</span>
+                  </div>
+                  <input type="range" id="cfg-image-intensity" min="1" max="10" step="1" value="5" />
+                  <div id="cfg-image-intensity-hint" class="slider-hint">色相 ±12° · 亮度 ±8% · 饱和度 ±14%</div>
+                </div>
+              </div>
               <label class="toggle-row">
                 <span>音频处理</span>
                 <input type="checkbox" id="cfg-audio" checked />

@@ -331,6 +331,7 @@ ipcMain.handle('save-feature-config', async (_event, flags) => {
     canObfuscation: saved.CAN_OBFUSCATION,
     canImageSwitch: saved.CAN_IMAGE_SWITCH,
     canAudioSwitch: saved.CAN_AUDIO_SWITCH,
+    imageColorIntensity: saved.IMAGE_COLOR_INTENSITY,
     configPath: saved.configPath || userConfig.getWritableConfigPath(),
   };
 });

@@ -12,6 +12,7 @@ const DEFAULTS = {
   OBFUSCATION_PREFER_RATIO: 1.5,
   OBFUSCATION_MAX_RATIO: 1.8,
   OBFUSCATION_TIER_GAP,
+  IMAGE_COLOR_INTENSITY: 5,
 };
 
 // 内置默认（兼容旧导出）
@@ -159,6 +160,24 @@ function pickBool(data, camelKey, upperKey, fallback) {
   return fallback;
 }
 
+function pickInt(data, camelKey, upperKey, fallback, min, max) {
+  const raw = data[camelKey] ?? data[upperKey];
+  let n = Math.round(Number(raw));
+  if (!Number.isFinite(n)) n = fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function buildImageColorRanges(intensity) {
+  const level = pickInt({ v: intensity }, 'v', 'v', DEFAULTS.IMAGE_COLOR_INTENSITY, 1, 10);
+  const factor = level / 5;
+  return {
+    intensity: level,
+    hueMax: Math.max(1, Math.round(12 * factor)),
+    brightPct: Math.max(1, Math.round(8 * factor)),
+    satPct: Math.max(1, Math.round(14 * factor)),
+  };
+}
+
 function pickRatio(data, camelKey, upperKey, fallback) {
   const raw = data[camelKey] ?? data[upperKey];
   const n = Number(raw);
@@ -205,6 +224,14 @@ function refreshFeatureFlags() {
     CAN_OBFUSCATION: pickBool(data, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
     CAN_IMAGE_SWITCH: pickBool(data, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
     CAN_AUDIO_SWITCH: pickBool(data, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
+    IMAGE_COLOR_INTENSITY: pickInt(
+      data,
+      'imageColorIntensity',
+      'IMAGE_COLOR_INTENSITY',
+      DEFAULTS.IMAGE_COLOR_INTENSITY,
+      1,
+      10,
+    ),
     OBFUSCATION_PREFER_RATIO: preferRatio,
     OBFUSCATION_MAX_RATIO: maxRatio,
     configPath: loaded?.configPath || null,
@@ -227,6 +254,14 @@ function applyFeatureFlags(overrides) {
     CAN_OBFUSCATION: pickBool(overrides, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION),
     CAN_IMAGE_SWITCH: pickBool(overrides, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH),
     CAN_AUDIO_SWITCH: pickBool(overrides, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH),
+    IMAGE_COLOR_INTENSITY: pickInt(
+      overrides,
+      'imageColorIntensity',
+      'IMAGE_COLOR_INTENSITY',
+      DEFAULTS.IMAGE_COLOR_INTENSITY,
+      1,
+      10,
+    ),
     OBFUSCATION_PREFER_RATIO: preferRatio,
     OBFUSCATION_MAX_RATIO: maxRatio,
     configPath: getWritableConfigPath(),
@@ -244,6 +279,14 @@ function saveFeatureFlags(flags) {
   data.canObfuscation = pickBool(flags, 'canObfuscation', 'CAN_OBFUSCATION', DEFAULTS.CAN_OBFUSCATION);
   data.canImageSwitch = pickBool(flags, 'canImageSwitch', 'CAN_IMAGE_SWITCH', DEFAULTS.CAN_IMAGE_SWITCH);
   data.canAudioSwitch = pickBool(flags, 'canAudioSwitch', 'CAN_AUDIO_SWITCH', DEFAULTS.CAN_AUDIO_SWITCH);
+  data.imageColorIntensity = pickInt(
+    flags,
+    'imageColorIntensity',
+    'IMAGE_COLOR_INTENSITY',
+    DEFAULTS.IMAGE_COLOR_INTENSITY,
+    1,
+    10,
+  );
   data.obfuscationPreferRatio = preferRatio;
   data.obfuscationMaxRatio = maxRatio;
   const configPath = getWritableConfigPath();
@@ -258,6 +301,8 @@ function getFeatureConfigForUi() {
     canObfuscation: flags.CAN_OBFUSCATION,
     canImageSwitch: flags.CAN_IMAGE_SWITCH,
     canAudioSwitch: flags.CAN_AUDIO_SWITCH,
+    imageColorIntensity: flags.IMAGE_COLOR_INTENSITY,
+    imageColorRanges: buildImageColorRanges(flags.IMAGE_COLOR_INTENSITY),
     obfuscationMaxRatio: flags.OBFUSCATION_MAX_RATIO,
     obfuscationPreferRatio: flags.OBFUSCATION_PREFER_RATIO,
     obfuscationTierGap: DEFAULTS.OBFUSCATION_TIER_GAP,
@@ -291,6 +336,7 @@ module.exports = {
   getObfuscationPresets,
   buildObfuscationPresets,
   buildLightObfuscationPreset,
+  buildImageColorRanges,
   deriveTierRatios,
   OBFUSCATION_TIER_GAP: DEFAULTS.OBFUSCATION_TIER_GAP,
   OBFUSCATION_LARGE_FILE_BYTES,

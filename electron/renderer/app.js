@@ -14,6 +14,10 @@ const cfgObfRatioVal = document.getElementById('cfg-obf-ratio-val');
 const cfgObfRatioHint = document.getElementById('cfg-obf-ratio-hint');
 const obfRatioRows = document.getElementById('obf-ratio-rows');
 const cfgImage = document.getElementById('cfg-image');
+const cfgImageIntensity = document.getElementById('cfg-image-intensity');
+const cfgImageIntensityVal = document.getElementById('cfg-image-intensity-val');
+const cfgImageIntensityHint = document.getElementById('cfg-image-intensity-hint');
+const imageIntensityRows = document.getElementById('image-intensity-rows');
 const cfgAudio = document.getElementById('cfg-audio');
 const logOutput = document.getElementById('log-output');
 const progressTrack = document.getElementById('progress-track');
@@ -156,6 +160,31 @@ function deriveTierRatios(maxRatio) {
   return { preferRatio: Math.min(prefer, max), maxRatio: max };
 }
 
+function clampIntensity(value, fallback = 5) {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, 10);
+}
+
+function getImageColorRanges(level) {
+  const intensity = clampIntensity(level);
+  const factor = intensity / 5;
+  return {
+    intensity,
+    hueMax: Math.max(1, Math.round(12 * factor)),
+    brightPct: Math.max(1, Math.round(8 * factor)),
+    satPct: Math.max(1, Math.round(14 * factor)),
+  };
+}
+
+function syncImageIntensityUi() {
+  const { intensity, hueMax, brightPct, satPct } = getImageColorRanges(cfgImageIntensity.value);
+  cfgImageIntensity.value = String(intensity);
+  cfgImageIntensityVal.textContent = String(intensity);
+  cfgImageIntensityHint.textContent = `色相 ±${hueMax}° · 亮度 ±${brightPct}% · 饱和度 ±${satPct}%`;
+  return intensity;
+}
+
 function syncObfRatioUi() {
   const { preferRatio, maxRatio } = deriveTierRatios(sliderToRatio(cfgObfRatio.value));
   cfgObfRatio.value = String(ratioToSlider(maxRatio));
@@ -166,12 +195,14 @@ function syncObfRatioUi() {
 
 function getFeatureFlagsFromUi() {
   const { preferRatio, maxRatio } = syncObfRatioUi();
+  const imageColorIntensity = syncImageIntensityUi();
   return {
     canObfuscation: cfgObfuscation.checked,
     canImageSwitch: cfgImage.checked,
     canAudioSwitch: cfgAudio.checked,
     obfuscationMaxRatio: maxRatio,
     obfuscationPreferRatio: preferRatio,
+    imageColorIntensity,
   };
 }
 
@@ -180,8 +211,11 @@ function applyFeatureFlagsToUi(flags) {
   cfgImage.checked = Boolean(flags.canImageSwitch);
   cfgAudio.checked = Boolean(flags.canAudioSwitch);
   cfgObfRatio.value = String(ratioToSlider(flags.obfuscationMaxRatio ?? 1.8));
+  cfgImageIntensity.value = String(clampIntensity(flags.imageColorIntensity ?? 5));
   syncObfRatioUi();
+  syncImageIntensityUi();
   updateObfRatioState();
+  updateImageIntensityState();
 }
 
 function updateObfRatioState() {
@@ -190,11 +224,18 @@ function updateObfRatioState() {
   cfgObfRatio.disabled = !on;
 }
 
+function updateImageIntensityState() {
+  const on = cfgImage.checked && !cfgImage.disabled;
+  imageIntensityRows.classList.toggle('disabled', !on);
+  cfgImageIntensity.disabled = !on;
+}
+
 function setFeatureControlsDisabled(disabled) {
   cfgObfuscation.disabled = disabled;
   cfgImage.disabled = disabled;
   cfgAudio.disabled = disabled;
   updateObfRatioState();
+  updateImageIntensityState();
 }
 
 async function loadFeatureConfig() {
@@ -279,7 +320,12 @@ function bindEvents() {
     if (!isProcessing) scheduleSaveFeatureConfig();
   });
 
-  [cfgImage, cfgAudio].forEach((input) => {
+  cfgImage.addEventListener('change', () => {
+    updateImageIntensityState();
+    if (!isProcessing) scheduleSaveFeatureConfig();
+  });
+
+  [cfgAudio].forEach((input) => {
     input.addEventListener('change', () => {
       if (!isProcessing) scheduleSaveFeatureConfig();
     });
@@ -287,6 +333,11 @@ function bindEvents() {
 
   cfgObfRatio.addEventListener('input', () => {
     syncObfRatioUi();
+    if (!isProcessing) scheduleSaveFeatureConfig();
+  });
+
+  cfgImageIntensity.addEventListener('input', () => {
+    syncImageIntensityUi();
     if (!isProcessing) scheduleSaveFeatureConfig();
   });
 

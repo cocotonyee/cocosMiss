@@ -21,6 +21,7 @@ const {
   applyFeatureFlags,
   getObfuscationPresets,
   buildLightObfuscationPreset,
+  buildImageColorRanges,
   OBFUSCATION_LARGE_FILE_BYTES,
 } = require('./config');
 
@@ -368,10 +369,11 @@ function isInWhitelist(filePath) {
 const IMAGE_MAX_SIZE_RATIO = 1.2;
 
 function randomColorModulation() {
+  const { hueMax, brightPct, satPct } = buildImageColorRanges(getFeatureFlags().IMAGE_COLOR_INTENSITY);
   return {
-    hue: crypto.randomInt(-6, 7),
-    brightness: 1 + crypto.randomInt(-3, 4) / 100,
-    saturation: 1 + crypto.randomInt(-6, 7) / 100,
+    hue: crypto.randomInt(-hueMax, hueMax + 1),
+    brightness: 1 + crypto.randomInt(-brightPct, brightPct + 1) / 100,
+    saturation: 1 + crypto.randomInt(-satPct, satPct + 1) / 100,
   };
 }
 
@@ -878,13 +880,13 @@ async function runPipeline(options = {}) {
     if (options.featureFlags) {
       applyFeatureFlags(options.featureFlags);
       console.log(
-        `[Config] 界面开关: 混淆=${options.featureFlags.canObfuscation} 图片=${options.featureFlags.canImageSwitch} 音频=${options.featureFlags.canAudioSwitch} tier1≤${options.featureFlags.obfuscationPreferRatio} tier2≤${options.featureFlags.obfuscationMaxRatio}`,
+        `[Config] 界面开关: 混淆=${options.featureFlags.canObfuscation} 图片=${options.featureFlags.canImageSwitch}(强度${options.featureFlags.imageColorIntensity ?? 5}) 音频=${options.featureFlags.canAudioSwitch} tier1≤${options.featureFlags.obfuscationPreferRatio} tier2≤${options.featureFlags.obfuscationMaxRatio}`,
       );
     } else {
       const flags = refreshFeatureFlags();
       if (flags.configPath) {
         console.log(`[Config] 已加载: ${flags.configPath}`);
-        console.log(`[Config] 混淆=${flags.CAN_OBFUSCATION} 图片=${flags.CAN_IMAGE_SWITCH} 音频=${flags.CAN_AUDIO_SWITCH} tier1≤${flags.OBFUSCATION_PREFER_RATIO} tier2≤${flags.OBFUSCATION_MAX_RATIO}`);
+        console.log(`[Config] 混淆=${flags.CAN_OBFUSCATION} 图片=${flags.CAN_IMAGE_SWITCH}(强度${flags.IMAGE_COLOR_INTENSITY}) 音频=${flags.CAN_AUDIO_SWITCH} tier1≤${flags.OBFUSCATION_PREFER_RATIO} tier2≤${flags.OBFUSCATION_MAX_RATIO}`);
       } else {
         console.log('[Config] 未找到 milfun.config.json，使用默认开关');
       }
