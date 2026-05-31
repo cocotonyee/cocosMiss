@@ -550,6 +550,18 @@ function buildImageEncodeOptions(ext, meta) {
     ? Math.min(9, Math.max(0, meta.compression))
     : 9;
 
+  const hasAlpha = Boolean(meta.hasAlpha || (meta.channels && meta.channels >= 4));
+  if (hasAlpha) {
+    return {
+      type: 'png',
+      options: {
+        compressionLevel,
+        effort: 1,
+        palette: false,
+      },
+    };
+  }
+
   if (meta.palette || colors <= 256) {
     return {
       type: 'png',
@@ -572,6 +584,82 @@ function buildImageEncodeOptions(ext, meta) {
   };
 }
 
+function imageHasAlpha(meta) {
+  return Boolean(meta.hasAlpha || (meta.channels && meta.channels >= 4));
+}
+
+function prepareRgbForAlphaModulate(data, channels) {
+  if (channels < 4) return;
+  for (let i = 0; i < data.length; i += channels) {
+    const a = data[i + 3];
+    if (a === 0) {
+      data[i] = 0;
+      data[i + 1] = 0;
+      data[i + 2] = 0;
+      continue;
+    }
+    if (a < 255) {
+      const f = a / 255;
+      data[i] = Math.round(data[i] * f);
+      data[i + 1] = Math.round(data[i + 1] * f);
+      data[i + 2] = Math.round(data[i + 2] * f);
+    }
+  }
+}
+
+function unpremultiplyRgbAfterModulate(data, channels) {
+  if (channels < 4) return;
+  for (let i = 0; i < data.length; i += channels) {
+    const a = data[i + 3];
+    if (a === 0) {
+      data[i] = 0;
+      data[i + 1] = 0;
+      data[i + 2] = 0;
+      continue;
+    }
+    if (a < 255) {
+      const f = 255 / a;
+      data[i] = Math.min(255, Math.round(data[i] * f));
+      data[i + 1] = Math.min(255, Math.round(data[i + 1] * f));
+      data[i + 2] = Math.min(255, Math.round(data[i + 2] * f));
+    }
+  }
+}
+
+async function rehashImageWithAlpha(inputPath, outputPath, mod, encodeOptions) {
+  const sharp = getSharp();
+  const src = sharp(inputPath, { failOn: 'none' }).ensureAlpha();
+  const alphaRaw = await src.clone().extractChannel('alpha').raw().toBuffer();
+
+  const { data, info } = await src.clone().raw().toBuffer({ resolveWithObject: true });
+  prepareRgbForAlphaModulate(data, info.channels);
+
+  const modulatedRgb = await sharp(data, {
+    raw: { width: info.width, height: info.height, channels: info.channels },
+  })
+    .removeAlpha()
+    .modulate(mod)
+    .raw()
+    .toBuffer();
+
+  const pixelCount = info.width * info.height;
+  const merged = Buffer.alloc(pixelCount * 4);
+  for (let p = 0; p < pixelCount; p++) {
+    const o = p * 4;
+    merged[o] = modulatedRgb[p * 3];
+    merged[o + 1] = modulatedRgb[p * 3 + 1];
+    merged[o + 2] = modulatedRgb[p * 3 + 2];
+    merged[o + 3] = alphaRaw[p];
+  }
+  unpremultiplyRgbAfterModulate(merged, 4);
+
+  await sharp(merged, {
+    raw: { width: info.width, height: info.height, channels: 4 },
+  })
+    .png(encodeOptions)
+    .toFile(outputPath);
+}
+
 async function rehashImage(inputPath, outputPath) {
   await ensureDirectoryExists(outputPath);
   const ext = path.extname(inputPath).toLowerCase();
@@ -584,11 +672,13 @@ async function rehashImage(inputPath, outputPath) {
   const meta = await image.metadata();
   const encode = buildImageEncodeOptions(ext, meta);
 
-  const pipeline = encode.type === 'jpeg'
-    ? image.modulate(mod).removeAlpha().jpeg(encode.options)
-    : image.modulate(mod).png(encode.options);
-
-  await pipeline.toFile(outputPath);
+  if (encode.type === 'jpeg') {
+    await image.modulate(mod).removeAlpha().jpeg(encode.options).toFile(outputPath);
+  } else if (imageHasAlpha(meta)) {
+    await rehashImageWithAlpha(inputPath, outputPath, mod, encode.options);
+  } else {
+    await image.modulate(mod).png(encode.options).toFile(outputPath);
+  }
 
   const outSize = fs.statSync(outputPath).size;
   const ms = Date.now() - started;
