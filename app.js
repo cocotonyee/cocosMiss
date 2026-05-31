@@ -775,23 +775,40 @@ async function moveNativeFile(inputPath, outputPath, fileExt) {
   await removePathAfterMove(inputPath, outputPath);
 }
 
-// ─── JSON 迁移 ──────────────────────────────────────────────
+const IMPORT_SIDECAR_EXTS = ['.json', '.bin'];
 
-async function migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem) {
+function buildImportSidecarFileName(parsed, renamedUUID, ext) {
+  if (parsed.hasAt) {
+    return `${renamedUUID}${parsed.afterAt}${parsed.extra ? `.${parsed.extra}` : ''}${ext}`;
+  }
+  return `${renamedUUID}${parsed.extra ? `.${parsed.extra}` : ''}${ext}`;
+}
+
+function listImportSidecarsForUuid(importSubDir, uuid) {
+  const hits = [];
+  if (!fs.existsSync(importSubDir)) return hits;
+  for (const file of fs.readdirSync(importSubDir)) {
+    const ext = path.extname(file).toLowerCase();
+    if (!IMPORT_SIDECAR_EXTS.includes(ext)) continue;
+    const parsed = extractUUIDAndExtra(path.basename(file, ext));
+    if (!parsed || parsed.notUUid || parsed.uuid !== uuid) continue;
+    hits.push({ file, ext, parsed });
+  }
+  return hits;
+}
+
+// ─── JSON / BIN import 迁移 ──────────────────────────────────
+
+async function migrateImportSidecars(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem) {
   const renamedUUID = plan.renamedUUID;
   const firstTwoChars = renamedUUID.substring(0, 2);
   const originalFirstTwoChars = uuidAndExtra.uuid.substring(0, 2);
   const importSubDir = path.join(subpackageDir, 'import', originalFirstTwoChars);
   if (!fs.existsSync(importSubDir)) return [];
 
-  const foundJsonFiles = fs.readdirSync(importSubDir).filter((f) => {
-    if (!f.endsWith('.json')) return false;
-    const parsed = extractUUIDAndExtra(path.basename(f, '.json'));
-    return parsed && parsed.uuid === uuidAndExtra.uuid;
-  });
-
-  if (!foundJsonFiles.length) {
-    vlog(`No JSON files found for UUID: ${uuidAndExtra.uuid}`);
+  const foundFiles = listImportSidecarsForUuid(importSubDir, uuidAndExtra.uuid);
+  if (!foundFiles.length) {
+    vlog(`No import sidecar found for UUID: ${uuidAndExtra.uuid}`);
     return [];
   }
 
@@ -800,35 +817,37 @@ async function migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplac
   const replaceCommands = buildPlanReplaceCommands(plan);
   const importMigrations = [];
 
-  for (const foundJsonFile of foundJsonFiles) {
-    const jsonFilePath = path.join(importSubDir, foundJsonFile);
-    const jsonUUIDAndExtra = extractUUIDAndExtra(path.basename(foundJsonFile, '.json'));
-    let newJsonFileName;
-    if (jsonUUIDAndExtra.hasAt) {
-      newJsonFileName = `${renamedUUID}${jsonUUIDAndExtra.afterAt}${jsonUUIDAndExtra.extra ? '.' + jsonUUIDAndExtra.extra : ''}.json`;
-    } else {
-      newJsonFileName = `${renamedUUID}${jsonUUIDAndExtra.extra ? '.' + jsonUUIDAndExtra.extra : ''}.json`;
-    }
-    const newJsonPath = path.join(newImportSubDir, newJsonFileName);
+  for (const { file: foundFile, ext, parsed: fileParsed } of foundFiles) {
+    const filePath = path.join(importSubDir, foundFile);
+    const newFileName = buildImportSidecarFileName(fileParsed, renamedUUID, ext);
+    const newPath = path.join(newImportSubDir, newFileName);
     pushImportJsonPathCommands(
       globalReplaceCommands,
       bundleRel,
       originalFirstTwoChars,
       firstTwoChars,
-      foundJsonFile,
-      newJsonFileName,
+      foundFile,
+      newFileName,
     );
-    const raw = fs.readFileSync(jsonFilePath, 'utf8');
-    fs.writeFileSync(newJsonPath, applyReplaceToContent(raw, replaceCommands), 'utf8');
-    await removePathAfterMove(jsonFilePath, newJsonPath);
-    importMigrations.push({ originalImportPath: jsonFilePath, newImportPath: newJsonPath });
-    vlog(`Migrated JSON: ${foundJsonFile} → ${newJsonFileName}`);
+    if (ext === '.json') {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      fs.writeFileSync(newPath, applyReplaceToContent(raw, replaceCommands), 'utf8');
+    } else {
+      await fs.copy(filePath, newPath);
+    }
+    await removePathAfterMove(filePath, newPath);
+    importMigrations.push({ originalImportPath: filePath, newImportPath: newPath });
+    vlog(`Migrated import ${ext}: ${foundFile} → ${newFileName}`);
   }
 
   if (resultItem) {
     resultItem.importMigrations = (resultItem.importMigrations || []).concat(importMigrations);
   }
   return importMigrations;
+}
+
+async function migrateImportJson(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem) {
+  return migrateImportSidecars(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem);
 }
 
 function buildBundlePathVariants(bundleRelPath, pathSearch, pathReplace) {
@@ -883,6 +902,18 @@ function buildPlanReplaceCommands(plan) {
   if (plan.importPathSearch) {
     pushPathReplaceCommands(commands, plan.importPathSearch, plan.importPathReplace);
   }
+  if (plan.nestedDirSearch && plan.nestedDirReplace && plan.nestedDirSearch !== plan.nestedDirReplace) {
+    pushPathReplaceCommands(commands, plan.nestedDirSearch, plan.nestedDirReplace);
+    const origPrefix = plan.plainUuidSearch?.substring(0, 2);
+    const newPrefix = plan.plainUuidReplace?.substring(0, 2);
+    if (origPrefix && newPrefix) {
+      pushPathReplaceCommands(
+        commands,
+        `${origPrefix}/${plan.nestedDirSearch}`,
+        `${newPrefix}/${plan.nestedDirReplace}`,
+      );
+    }
+  }
   pushUuidReplaceCommands(commands, plan);
   return sortReplaceCommands(commands);
 }
@@ -910,9 +941,52 @@ function pushPathReplaceCommands(commands, search, replace) {
 }
 
 const UUID_DIR_REGEX = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+/** 任意 @ 或 . 后缀（非写死 42cb8）：uuid@6c48a、uuid.42cb8、uuid.a1b2c3 等 */
+const UUID_DIR_WITH_SUFFIX_REGEX = /^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})(@\S+|\.\S+)$/i;
+
+/** Cocos native 子目录：纯 UUID，或带任意 @ / . 后缀的目录名 */
+function parseUuidDirName(dirName) {
+  if (!dirName) return null;
+  if (UUID_DIR_REGEX.test(dirName)) {
+    return {
+      uuid: dirName,
+      afterAt: '',
+      extra: '',
+      fullName: dirName,
+      hasAt: false,
+      notUUid: false,
+    };
+  }
+  const m = dirName.match(UUID_DIR_WITH_SUFFIX_REGEX);
+  if (m) {
+    return {
+      uuid: m[1],
+      afterAt: m[2],
+      extra: '',
+      fullName: dirName,
+      hasAt: true,
+      notUUid: false,
+    };
+  }
+  const parsed = extractUUIDAndExtra(dirName);
+  if (parsed && !parsed.notUUid) {
+    return { ...parsed, fullName: dirName };
+  }
+  return null;
+}
 
 function isUuidDirectoryName(name) {
-  return UUID_DIR_REGEX.test(name);
+  return Boolean(parseUuidDirName(name));
+}
+
+function buildRenamedNativeDirKey(uuidAndExtra, renamedUUID) {
+  if (uuidAndExtra.afterAt) return `${renamedUUID}${uuidAndExtra.afterAt}`;
+  if (uuidAndExtra.fullName && uuidAndExtra.fullName !== uuidAndExtra.uuid) {
+    const suffix = uuidAndExtra.fullName.slice(uuidAndExtra.uuid.length);
+    if (suffix) return `${renamedUUID}${suffix}`;
+  }
+  if (uuidAndExtra.extra) return `${renamedUUID}.${uuidAndExtra.extra}`;
+  return renamedUUID;
 }
 
 function extractNativeFileNameFromImportJson(content) {
@@ -946,9 +1020,12 @@ function collectBundleAssetUuids(bundlePath) {
       if (!fs.lstatSync(subPath).isDirectory()) continue;
       for (const file of fs.readdirSync(subPath)) {
         const filePath = path.join(subPath, file);
-        if (fs.lstatSync(filePath).isDirectory() && isUuidDirectoryName(file)) {
-          uuids.add(file);
-          continue;
+        if (fs.lstatSync(filePath).isDirectory()) {
+          const dirParsed = parseUuidDirName(file);
+          if (dirParsed) {
+            uuids.add(dirParsed.uuid);
+            continue;
+          }
         }
         const ext = path.extname(file).toLowerCase();
         const baseName = ext ? path.basename(file, ext) : file;
@@ -1010,8 +1087,19 @@ function buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath,
   let searchString;
   let replaceString;
 
+  let nestedDirSearch = '';
+  let nestedDirReplace = '';
   if (isNestedNative) {
-    newFileName = `${renamedUUID}/${path.basename(originalFileName)}`;
+    const slash = originalFileName.indexOf('/');
+    const dirKey = slash >= 0 ? originalFileName.slice(0, slash) : '';
+    const filePart = slash >= 0 ? originalFileName.slice(slash + 1) : originalFileName;
+    const dirParsed = dirKey ? parseUuidDirName(dirKey) : null;
+    const newDirKey = buildRenamedNativeDirKey(dirParsed || uuidAndExtra, renamedUUID);
+    newFileName = filePart ? `${newDirKey}/${filePart}` : newDirKey;
+    if (dirKey) {
+      nestedDirSearch = dirKey;
+      nestedDirReplace = newDirKey;
+    }
     searchString = originalEncryptedName;
     replaceString = encryptedRenamedName;
   } else if (uuidAndExtra.hasAt) {
@@ -1041,13 +1129,14 @@ function buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath,
   let importPathReplace = '';
   let importPathVariants = [];
   if (!skipImportPaths) {
-    const defaultImportOld = `${uuidAndExtra.uuid}.json`;
-    const defaultImportNew = `${renamedUUID}.json`;
-    importPathSearch = `import/${origPrefix}/${defaultImportOld}`;
-    importPathReplace = `import/${newPrefix}/${defaultImportNew}`;
-    importPathVariants = bundleRelPath
-      ? buildBundlePathVariants(bundleRelPath, importPathSearch, importPathReplace)
-      : [];
+    importPathSearch = `import/${origPrefix}/${uuidAndExtra.uuid}.json`;
+    importPathReplace = `import/${newPrefix}/${renamedUUID}.json`;
+    for (const impExt of IMPORT_SIDECAR_EXTS) {
+      const search = `import/${origPrefix}/${uuidAndExtra.uuid}${impExt}`;
+      const replace = `import/${newPrefix}/${renamedUUID}${impExt}`;
+      const variants = bundleRelPath ? buildBundlePathVariants(bundleRelPath, search, replace) : [];
+      importPathVariants = importPathVariants.concat(variants);
+    }
   }
 
   return {
@@ -1064,6 +1153,8 @@ function buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath,
     importPathSearch,
     importPathReplace,
     importPathVariants,
+    nestedDirSearch,
+    nestedDirReplace,
   };
 }
 
@@ -1099,6 +1190,18 @@ function pushReplaceCommands(commands, plan, options = {}) {
   if (plan.importPathSearch) {
     pushPathReplaceCommands(commands, plan.importPathSearch, plan.importPathReplace);
   }
+  if (plan.nestedDirSearch && plan.nestedDirReplace && plan.nestedDirSearch !== plan.nestedDirReplace) {
+    pushPathReplaceCommands(commands, plan.nestedDirSearch, plan.nestedDirReplace);
+    const origPrefix = plan.plainUuidSearch?.substring(0, 2);
+    const newPrefix = plan.plainUuidReplace?.substring(0, 2);
+    if (origPrefix && newPrefix) {
+      pushPathReplaceCommands(
+        commands,
+        `${origPrefix}/${plan.nestedDirSearch}`,
+        `${newPrefix}/${plan.nestedDirReplace}`,
+      );
+    }
+  }
   pushUuidReplaceCommands(commands, plan, options.uuidReplaceDedupe);
 }
 
@@ -1132,7 +1235,7 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
   if (!FILE_EXTENSIONS.NATIVE.includes(fileExt)) return;
 
   const uuidAndExtra = uuidDir
-    ? extractUUIDAndExtra(uuidDir)
+    ? parseUuidDirName(uuidDir)
     : extractUUIDAndExtra(path.basename(file, fileExt));
   if (!uuidAndExtra) {
     vlog(`Skipping non-UUID file: ${file}`);
@@ -1200,21 +1303,49 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
   }
 }
 
-async function migrateCompanionNative(subpackageDir, uuidAndExtra, plan, nativeFileName, globalReplaceCommands, bundleRel) {
-  const origPrefix = uuidAndExtra.uuid.substring(0, 2);
-  const newPrefix = plan.renamedUUID.substring(0, 2);
-  const nestedRelative = `${uuidAndExtra.uuid}/${nativeFileName}`;
-  const newNestedRelative = `${plan.renamedUUID}/${nativeFileName}`;
-  const nativePathSearch = `native/${origPrefix}/${nestedRelative}`;
-  const nativePathReplace = `native/${newPrefix}/${newNestedRelative}`;
-  pushNativePathReplaceCommands(globalReplaceCommands, bundleRel, nativePathSearch, nativePathReplace);
+function findCompanionNativeSource(subpackageDir, uuidAndExtra, nativeFileName) {
+  const prefix = uuidAndExtra.uuid.substring(0, 2);
+  const nativePrefixDir = path.join(subpackageDir, 'native', prefix);
+  const candidateDirs = new Set();
+  if (uuidAndExtra.fullName) candidateDirs.add(uuidAndExtra.fullName);
+  candidateDirs.add(uuidAndExtra.uuid);
+  if (fs.existsSync(nativePrefixDir)) {
+    for (const entry of fs.readdirSync(nativePrefixDir)) {
+      if (parseUuidDirName(entry)) candidateDirs.add(entry);
+    }
+  }
+  for (const dirKey of candidateDirs) {
+    const candidate = path.join(nativePrefixDir, dirKey, nativeFileName);
+    if (isValidOutputFile(candidate)) {
+      return { sourcePath: candidate, dirKey };
+    }
+  }
+  return null;
+}
 
-  const originalNativePath = path.join(subpackageDir, 'native', origPrefix, nestedRelative);
-  const newNativePath = path.join(subpackageDir, 'native', newPrefix, newNestedRelative);
-  if (!fs.existsSync(originalNativePath)) {
+async function migrateCompanionNative(subpackageDir, uuidAndExtra, plan, nativeFileName, globalReplaceCommands, bundleRel) {
+  const found = findCompanionNativeSource(subpackageDir, uuidAndExtra, nativeFileName);
+  if (!found) {
     vlog(`No companion native for UUID: ${uuidAndExtra.uuid} (${nativeFileName})`);
     return null;
   }
+
+  const { sourcePath: originalNativePath, dirKey } = found;
+  const origPrefix = uuidAndExtra.uuid.substring(0, 2);
+  const newPrefix = plan.renamedUUID.substring(0, 2);
+  const dirParsed = parseUuidDirName(dirKey) || uuidAndExtra;
+  const newDirKey = buildRenamedNativeDirKey(dirParsed, plan.renamedUUID);
+  const nestedRelative = `${dirKey}/${nativeFileName}`;
+  const newNestedRelative = `${newDirKey}/${nativeFileName}`;
+  const nativePathSearch = `native/${origPrefix}/${nestedRelative}`;
+  const nativePathReplace = `native/${newPrefix}/${newNestedRelative}`;
+  pushNativePathReplaceCommands(globalReplaceCommands, bundleRel, nativePathSearch, nativePathReplace);
+  if (dirKey !== newDirKey) {
+    pushPathReplaceCommands(globalReplaceCommands, dirKey, newDirKey);
+    pushPathReplaceCommands(globalReplaceCommands, `${origPrefix}/${dirKey}`, `${newPrefix}/${newDirKey}`);
+  }
+
+  const newNativePath = path.join(subpackageDir, 'native', newPrefix, newNestedRelative);
   await ensureDirectoryExists(newNativePath);
   await fs.copy(originalNativePath, newNativePath);
   await removePathAfterMove(originalNativePath, newNativePath);
@@ -1223,60 +1354,63 @@ async function migrateCompanionNative(subpackageDir, uuidAndExtra, plan, nativeF
 }
 
 async function processImportOnlyAsset(subpackageDir, importSubDir, file, uuidAndExtra, globalReplaceCommands, results, bundleRel, sharedState) {
+  const fileExt = path.extname(file).toLowerCase() || '.json';
   const plan = resolveSharedRenamePlan(
     uuidAndExtra,
-    '.json',
+    fileExt,
     file,
     bundleRel,
     sharedState.uuidRegistry,
     { skipNativePaths: true },
   );
-  const firstTwoChars = plan.renamedUUID.substring(0, 2);
-  const originalPath = path.join(importSubDir, file);
-  const newImportSubDir = path.join(subpackageDir, 'import', firstTwoChars);
-  await fs.mkdir(newImportSubDir, { recursive: true });
-  const newPath = path.join(newImportSubDir, plan.newFileName);
 
   vlog(`Processing import-only: ${file} → ${plan.newFileName}`);
-  const replaceCommands = buildPlanReplaceCommands(plan);
-  const raw = fs.readFileSync(originalPath, 'utf8');
-  fs.writeFileSync(newPath, applyReplaceToContent(raw, replaceCommands), 'utf8');
-  await removePathAfterMove(originalPath, newPath);
-
-  pushImportOnlyReplaceCommands(globalReplaceCommands, plan, { uuidReplaceDedupe: sharedState.uuidReplaceDedupe });
-  pushImportJsonPathCommands(
-    globalReplaceCommands,
-    bundleRel,
-    uuidAndExtra.uuid.substring(0, 2),
-    firstTwoChars,
-    file,
-    plan.newFileName,
-  );
-  patchBundleConfig(subpackageDir, plan);
-
-  const nativeFileName = extractNativeFileNameFromImportJson(raw);
-  const companionNative = nativeFileName
-    ? await migrateCompanionNative(
-      subpackageDir,
-      uuidAndExtra,
-      plan,
-      nativeFileName,
-      globalReplaceCommands,
-      bundleRel,
-    )
-    : null;
-
-  results.push({
+  const resultItem = {
     originalFile: file,
     newFileName: plan.newFileName,
     uuid: uuidAndExtra.uuid,
     subpackageRel: bundleRel,
-    originalPath,
-    newPath,
-    importMigrations: [{ originalImportPath: originalPath, newImportPath: newPath }],
-    companionNative,
     importOnly: true,
     ...plan,
+  };
+
+  const migrations = await migrateImportSidecars(
+    subpackageDir,
+    uuidAndExtra,
+    plan,
+    globalReplaceCommands,
+    bundleRel,
+    resultItem,
+  );
+  if (!migrations.length) return;
+
+  resultItem.importMigrations = migrations;
+  resultItem.originalPath = migrations[0].originalImportPath;
+  resultItem.newPath = migrations[0].newImportPath;
+
+  pushImportOnlyReplaceCommands(globalReplaceCommands, plan, { uuidReplaceDedupe: sharedState.uuidReplaceDedupe });
+  patchBundleConfig(subpackageDir, plan);
+
+  const jsonMigration = migrations.find((m) => m.newImportPath.endsWith('.json'));
+  let companionNative = null;
+  if (jsonMigration && fs.existsSync(jsonMigration.newImportPath)) {
+    const raw = fs.readFileSync(jsonMigration.newImportPath, 'utf8');
+    const nativeFileName = extractNativeFileNameFromImportJson(raw);
+    if (nativeFileName) {
+      companionNative = await migrateCompanionNative(
+        subpackageDir,
+        uuidAndExtra,
+        plan,
+        nativeFileName,
+        globalReplaceCommands,
+        bundleRel,
+      );
+    }
+  }
+
+  results.push({
+    ...resultItem,
+    companionNative,
   });
 }
 
@@ -1299,11 +1433,21 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
   for (const sub of fs.readdirSync(importDir)) {
     const subPath = path.join(importDir, sub);
     if (!fs.lstatSync(subPath).isDirectory()) continue;
+
+    const orphanByUuid = new Map();
     for (const file of fs.readdirSync(subPath)) {
-      if (!file.endsWith('.json')) continue;
-      const parsed = extractUUIDAndExtra(path.basename(file, '.json'));
-      if (!parsed || parsed.notUUid) continue;
-      if (processedUuids.has(parsed.uuid)) continue;
+      const ext = path.extname(file).toLowerCase();
+      if (!IMPORT_SIDECAR_EXTS.includes(ext)) continue;
+      const parsed = extractUUIDAndExtra(path.basename(file, ext));
+      if (!parsed || parsed.notUUid || processedUuids.has(parsed.uuid)) continue;
+      if (!orphanByUuid.has(parsed.uuid)) {
+        orphanByUuid.set(parsed.uuid, { parsed, file });
+      } else if (ext === '.json') {
+        orphanByUuid.set(parsed.uuid, { parsed, file });
+      }
+    }
+
+    for (const { parsed, file } of orphanByUuid.values()) {
       processedUuids.add(parsed.uuid);
       await processImportOnlyAsset(subpackageDir, subPath, file, parsed, globalReplaceCommands, results, bundleRel, sharedState);
     }
