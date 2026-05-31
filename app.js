@@ -466,25 +466,46 @@ async function rehashImage(inputPath, outputPath) {
 
 async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
   const tempPath = `${outputPath}.milfun-${process.pid}-${Date.now()}.tmp`;
+  let usedTemp = false;
   try {
     if (FILE_EXTENSIONS.IMAGE.includes(fileExt)) {
       if (getFeatureFlags().CAN_IMAGE_SWITCH) {
-        await rehashImage(inputPath, tempPath);
+        try {
+          await rehashImage(inputPath, tempPath);
+          usedTemp = true;
+        } catch (err) {
+          await forceRemoveFile(tempPath).catch(() => {});
+          await copyNativeFallback(inputPath, tempPath, `image: ${err.message}`);
+          usedTemp = true;
+        }
       } else {
         await fs.copy(inputPath, tempPath);
+        usedTemp = true;
       }
     } else if (getFeatureFlags().CAN_AUDIO_SWITCH && FILE_EXTENSIONS.AUDIO.includes(fileExt)) {
       await processAudioFile(inputPath, tempPath, 'medium');
+      usedTemp = true;
     } else {
       await fs.copy(inputPath, tempPath);
+      usedTemp = true;
+    }
+
+    if (!isValidOutputFile(usedTemp ? tempPath : outputPath)) {
+      throw new Error('empty or missing output');
     }
 
     if (fs.existsSync(outputPath)) await forceRemoveFile(outputPath);
     await fs.rename(tempPath, outputPath);
+    usedTemp = false;
   } catch (err) {
-    await forceRemoveFile(tempPath).catch(() => {});
-    console.warn(`Process native fallback copy: ${path.basename(inputPath)} (${err.message})`);
-    await fs.copy(inputPath, outputPath);
+    if (usedTemp) await forceRemoveFile(tempPath).catch(() => {});
+    if (!isValidOutputFile(outputPath)) {
+      await copyNativeFallback(inputPath, outputPath, err.message);
+    }
+  }
+
+  if (!isValidOutputFile(outputPath)) {
+    throw new Error(`Failed to write native file: ${path.basename(outputPath)}`);
   }
 }
 
@@ -493,6 +514,10 @@ async function moveNativeFile(inputPath, outputPath, fileExt) {
 
   await ensureDirectoryExists(outputPath);
   await writeProcessedNativeFile(inputPath, outputPath, fileExt);
+
+  if (!isValidOutputFile(outputPath) && fs.existsSync(inputPath)) {
+    await copyNativeFallback(inputPath, outputPath, 'verify failed');
+  }
 
   if (path.resolve(inputPath) !== path.resolve(outputPath)) {
     await forceRemoveFile(inputPath);
@@ -538,7 +563,7 @@ async function migrateImportJson(subpackageDir, uuidAndExtra, renamedUUID, first
   removeEmptyDir(importSubDir);
 }
 
-function buildRenamePlan(uuidAndExtra, fileExt) {
+function buildRenamePlan(uuidAndExtra, fileExt, originalFileName) {
   let originalEncryptedName;
   let encryptedRenamedName;
   let renamedUUID;
@@ -567,7 +592,43 @@ function buildRenamePlan(uuidAndExtra, fileExt) {
     replaceString = encryptedRenamedName;
   }
 
-  return { renamedUUID, newFileName, searchString, replaceString, hasAt: uuidAndExtra.hasAt };
+  const origPrefix = uuidAndExtra.uuid.substring(0, 2);
+  const newPrefix = renamedUUID.substring(0, 2);
+
+  return {
+    renamedUUID,
+    newFileName,
+    searchString,
+    replaceString,
+    hasAt: uuidAndExtra.hasAt,
+    plainUuidSearch: uuidAndExtra.uuid,
+    plainUuidReplace: renamedUUID,
+    nativePathSearch: `native/${origPrefix}/${originalFileName}`,
+    nativePathReplace: `native/${newPrefix}/${newFileName}`,
+  };
+}
+
+function pushReplaceCommands(commands, plan) {
+  commands.push({ search: plan.searchString, replace: plan.replaceString, hasAt: plan.hasAt });
+  if (plan.plainUuidSearch && plan.plainUuidSearch !== plan.plainUuidReplace) {
+    commands.push({ search: plan.plainUuidSearch, replace: plan.plainUuidReplace, hasAt: false });
+  }
+  if (plan.nativePathSearch && plan.nativePathSearch !== plan.nativePathReplace) {
+    commands.push({ search: plan.nativePathSearch, replace: plan.nativePathReplace, hasAt: false });
+  }
+}
+
+async function copyNativeFallback(inputPath, outputPath, reason) {
+  if (!fs.existsSync(inputPath)) {
+    throw new Error(`Source missing for fallback copy: ${path.basename(inputPath)}`);
+  }
+  await ensureDirectoryExists(outputPath);
+  await fs.copy(inputPath, outputPath);
+  console.warn(`Fallback copy: ${path.basename(outputPath)} (${reason})`);
+}
+
+function isValidOutputFile(filePath) {
+  return fs.existsSync(filePath) && fs.statSync(filePath).size > 0;
 }
 
 // ─── 单资源 / 子包处理 ──────────────────────────────────────
@@ -583,7 +644,7 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
     return;
   }
 
-  const plan = buildRenamePlan(uuidAndExtra, fileExt);
+  const plan = buildRenamePlan(uuidAndExtra, fileExt, file);
   const firstTwoChars = plan.renamedUUID.substring(0, 2);
   const newNativeSubDir = path.join(subpackageDir, 'native', firstTwoChars);
   await fs.mkdir(newNativeSubDir, { recursive: true });
@@ -601,9 +662,47 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
 
   await migrateImportJson(subpackageDir, uuidAndExtra, plan.renamedUUID, firstTwoChars);
 
-  const cmd = { search: plan.searchString, replace: plan.replaceString, hasAt: plan.hasAt };
-  globalReplaceCommands.push(cmd);
-  results.push({ originalFile: file, newFileName: plan.newFileName, ...cmd });
+  pushReplaceCommands(globalReplaceCommands, plan);
+  const bundleParent = path.basename(path.dirname(subpackageDir));
+  const bundleName = path.basename(subpackageDir);
+  results.push({
+    originalFile: file,
+    newFileName: plan.newFileName,
+    uuid: uuidAndExtra.uuid,
+    subpackageRel: path.join(bundleParent, bundleName),
+    newPath,
+    ...plan,
+  });
+}
+
+async function recoverMissingNativeAssets(sourceDir, results) {
+  let recovered = 0;
+  let missing = 0;
+  for (const item of results) {
+    if (isValidOutputFile(item.newPath)) continue;
+
+    const srcPath = path.join(
+      sourceDir,
+      item.subpackageRel,
+      'native',
+      item.uuid.substring(0, 2),
+      item.originalFile,
+    );
+
+    if (fs.existsSync(srcPath)) {
+      await ensureDirectoryExists(item.newPath);
+      await fs.copy(srcPath, item.newPath);
+      console.warn(`Recovered from source: ${item.newFileName}`);
+      recovered++;
+    } else {
+      console.error(`Missing native asset: ${item.newPath}`);
+      missing++;
+    }
+  }
+  if (recovered || missing) {
+    console.log(`[Recover] restored=${recovered} stillMissing=${missing}`);
+  }
+  return { recovered, missing };
 }
 
 async function processSubpackage(subpackageDir, results, globalReplaceCommands) {
@@ -853,6 +952,8 @@ async function main(options = {}) {
 
   step(3, 'Processing bundles (parallel)...');
   await processAllBundles(subpackagesDir, assetsDir, results, globalReplaceCommands);
+
+  await recoverMissingNativeAssets(sourceDir, results);
 
   const replaceCommandsFile = path.join(appRoot, 'replace_commands_global.json');
   fs.writeFileSync(replaceCommandsFile, JSON.stringify(globalReplaceCommands, null, 2));
