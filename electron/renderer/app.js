@@ -16,12 +16,16 @@ const obfRatioRows = document.getElementById('obf-ratio-rows');
 const cfgImage = document.getElementById('cfg-image');
 const cfgAudio = document.getElementById('cfg-audio');
 const logOutput = document.getElementById('log-output');
+const progressTrack = document.getElementById('progress-track');
 const progressFill = document.getElementById('progress-fill');
 const progressPercent = document.getElementById('progress-percent');
+const progressSpinner = document.getElementById('progress-spinner');
+const processingStatus = document.getElementById('processing-status');
 const setupOverlay = document.getElementById('setup-overlay');
 const setupLog = document.getElementById('setup-log');
 
 const OBF_TIER_GAP = 0.3;
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 let sourcePath = '';
 let processedDir = '';
@@ -29,6 +33,9 @@ let licenseValid = false;
 let isProcessing = false;
 let appReady = false;
 let saveConfigTimer = null;
+let spinnerTimer = null;
+let spinnerFrame = 0;
+let statusMessage = '';
 
 function shortPath(p) {
   if (!p) return './src';
@@ -44,6 +51,9 @@ function appendLog(level, message) {
   line.textContent = message;
   logOutput.appendChild(line);
   logOutput.scrollTop = logOutput.scrollHeight;
+  if (isProcessing && (level === 'info' || level === 'warn')) {
+    setProcessingMessage(message);
+  }
 }
 
 function appendSetupLog(message) {
@@ -56,7 +66,55 @@ function setProgress(step, total) {
   const pct = total > 0 ? Math.round((step / total) * 100) : 0;
   progressFill.style.width = `${pct}%`;
   progressPercent.textContent = `${pct}%`;
-  progressFill.classList.toggle('active', pct > 0);
+  progressFill.classList.toggle('active', pct > 0 || isProcessing);
+}
+
+function setProcessingMessage(message) {
+  if (!message) return;
+  const text = String(message).trim();
+  if (!text) return;
+  statusMessage = text.length > 42 ? `…${text.slice(-41)}` : text;
+  if (processingStatus && isProcessing) {
+    processingStatus.textContent = statusMessage;
+  }
+}
+
+function startSpinner() {
+  stopSpinner();
+  spinnerTimer = setInterval(() => {
+    spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+    progressSpinner.textContent = SPINNER_FRAMES[spinnerFrame];
+  }, 80);
+}
+
+function stopSpinner() {
+  if (spinnerTimer) {
+    clearInterval(spinnerTimer);
+    spinnerTimer = null;
+  }
+  progressSpinner.textContent = '';
+}
+
+function setProcessingUi(active, message = '') {
+  document.querySelector('.app').classList.toggle('is-processing', active);
+  progressTrack.classList.toggle('processing', active);
+  progressFill.classList.toggle('processing', active);
+  btnStart.classList.toggle('processing', active);
+  progressSpinner.classList.toggle('hidden', !active);
+  processingStatus.classList.toggle('hidden', !active);
+
+  if (active) {
+    btnStart.textContent = '◌ 处理中';
+    statusMessage = message || '正在处理…';
+    processingStatus.textContent = statusMessage;
+    startSpinner();
+    progressFill.classList.add('active');
+  } else {
+    btnStart.textContent = '▶ 开始处理';
+    statusMessage = '';
+    processingStatus.textContent = '';
+    stopSpinner();
+  }
 }
 
 function setLicenseBadge(result) {
@@ -186,11 +244,15 @@ function bindEvents() {
 
   window.milfun.onProgress(({ step, total, message }) => {
     setProgress(step, total);
-    if (message) appendLog('info', message);
+    if (message) {
+      appendLog('info', message);
+      setProcessingMessage(message);
+    }
   });
 
   window.milfun.onProcessingState(({ running }) => {
     isProcessing = running;
+    setProcessingUi(running);
     btnStart.disabled = running || !licenseValid || !appReady;
     btnOpenOutput.disabled = running || !appReady;
     btnBrowse.disabled = running;

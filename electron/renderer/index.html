@@ -73,9 +73,13 @@
     <div id="log-output" class="log-box"></div>
 
     <footer class="progress-footer">
-      <div class="progress-track">
-        <div id="progress-fill" class="progress-fill"></div>
+      <div class="progress-col">
+        <div id="progress-track" class="progress-track">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <span id="processing-status" class="processing-status hidden"></span>
       </div>
+      <span id="progress-spinner" class="progress-spinner hidden" aria-hidden="true"></span>
       <span id="progress-percent" class="progress-pct">0%</span>
     </footer>
   </div>

@@ -359,6 +359,19 @@ body {
   cursor: not-allowed;
 }
 
+.btn-start.processing:disabled {
+  opacity: 1;
+  cursor: wait;
+  border-color: var(--green);
+  color: var(--green);
+  animation: btn-processing-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes btn-processing-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
 .btn-open-output {
   flex-shrink: 0;
   width: auto;
@@ -423,9 +436,17 @@ body {
 
 .progress-footer {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-end;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+.progress-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
 }
 
 .progress-track {
@@ -436,15 +457,79 @@ body {
   overflow: hidden;
 }
 
+.progress-track.processing {
+  border-color: #3d5c3d;
+  animation: track-glow 1.8s ease-in-out infinite;
+}
+
+@keyframes track-glow {
+  0%, 100% { border-color: #3a4a3a; }
+  50% { border-color: #5a8a5a; }
+}
+
 .progress-fill {
   height: 100%;
   width: 0%;
   background: var(--border-light);
   transition: width 0.35s ease;
+  position: relative;
+  overflow: hidden;
 }
 
 .progress-fill.active {
   background: var(--text-dim);
+}
+
+.progress-fill.processing {
+  background: #4a6a4a;
+}
+
+.progress-fill.processing::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(111, 207, 111, 0.15) 35%,
+    rgba(111, 207, 111, 0.55) 50%,
+    rgba(111, 207, 111, 0.15) 65%,
+    transparent 100%
+  );
+  animation: progress-shimmer 1.2s linear infinite;
+}
+
+@keyframes progress-shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+
+.processing-status {
+  font-size: 8px;
+  color: var(--green);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
+}
+
+.processing-status.hidden {
+  display: none;
+}
+
+.progress-spinner {
+  font-size: 11px;
+  color: var(--green);
+  line-height: 1;
+  min-width: 12px;
+  text-align: center;
+  padding-bottom: 1px;
+  flex-shrink: 0;
+}
+
+.progress-spinner.hidden {
+  display: none;
 }
 
 .progress-pct {
@@ -452,4 +537,10 @@ body {
   color: var(--text-dim);
   min-width: 28px;
   text-align: right;
+  flex-shrink: 0;
+  padding-bottom: 1px;
+}
+
+.app.is-processing .log-box {
+  border-color: #3a4a3a;
 }

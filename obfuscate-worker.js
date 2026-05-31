@@ -8,8 +8,8 @@ parentPort.on('message', (msg) => {
     const result = loadJavaScriptObfuscator()
       .obfuscate(msg.code, msg.options)
       .getObfuscatedCode();
-    parentPort.postMessage({ ok: true, result });
+    parentPort.postMessage({ id: msg.id, ok: true, result });
   } catch (err) {
-    parentPort.postMessage({ ok: false, error: err.message || String(err) });
+    parentPort.postMessage({ id: msg.id, ok: false, error: err.message || String(err) });
   }
 });

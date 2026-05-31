@@ -1,8 +1,9 @@
 const crypto = require('crypto');
 const fs = require('fs-extra');
+const os = require('os');
 const path = require('path');
 const { exec, execSync } = require('child_process');
-const { Worker } = require('worker_threads');
+const { ObfuscatorPool } = require('./obfuscator-pool');
 
 let _sharp;
 function getSharp() {
@@ -255,6 +256,31 @@ async function forceRemoveFile(filePath) {
       reject(err);
     }
   });
+}
+
+function getCpuCount() {
+  return Math.max(1, os.cpus()?.length || 1);
+}
+
+function getNativeConcurrency() {
+  const cpus = getCpuCount();
+  if (process.platform === 'win32') return Math.min(4, Math.max(2, Math.floor(cpus / 2)));
+  return Math.min(8, Math.max(4, cpus - 1));
+}
+
+function getBundleConcurrency() {
+  return Math.min(6, Math.max(2, getCpuCount() - 1));
+}
+
+function getObfuscationConcurrency() {
+  return Math.min(4, Math.max(1, Math.floor(getCpuCount() / 2)));
+}
+
+function listBundleDirs(baseDir) {
+  if (!fs.existsSync(baseDir)) return [];
+  return fs.readdirSync(baseDir)
+    .map((name) => path.join(baseDir, name))
+    .filter((p) => fs.lstatSync(p).isDirectory());
 }
 
 async function runWithConcurrency(items, worker, limit = 4) {
@@ -605,15 +631,16 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
   await runWithConcurrency(
     tasks,
     (task) => processOneAsset(task.subpackageDir, task.currentNativeSubDir, task.file, globalReplaceCommands, results),
-    process.platform === 'win32' ? 1 : 4,
+    getNativeConcurrency(),
   );
   for (const subDirPath of nativeSubDirs) removeEmptyDir(subDirPath);
   console.log(`[Bundle] ${subpackageName} done (${tasks.length} assets)`);
 }
 
-// ─── JS 混淆（三档 + 体积保护，Worker 线程）────────────────
+// ─── JS 混淆（Worker 池 + 并行）────────────────────────────
 
 const OBFUSCATION_WORKER_TIMEOUT_MS = 20 * 60 * 1000;
+let _obfuscatorPool = null;
 
 function resolveObfuscateWorkerPath() {
   const candidates = [
@@ -654,37 +681,28 @@ function pickObfuscationPresets(originalSize, code) {
   return { skip: false, presets: getObfuscationPresets() };
 }
 
-function obfuscateInWorker(code, options) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(resolveObfuscateWorkerPath());
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      worker.terminate().catch(() => {});
-      reject(new Error('Obfuscation timeout'));
-    }, OBFUSCATION_WORKER_TIMEOUT_MS);
-
-    worker.once('message', (msg) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      worker.terminate().catch(() => {});
-      if (msg.ok) resolve(msg.result);
-      else reject(new Error(msg.error || 'Obfuscation failed'));
-    });
-    worker.once('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      worker.terminate().catch(() => {});
-      reject(err);
-    });
-    worker.postMessage({ code, options });
-  });
+async function getObfuscatorPool() {
+  if (!_obfuscatorPool) {
+    const size = getObfuscationConcurrency();
+    _obfuscatorPool = new ObfuscatorPool(size, resolveObfuscateWorkerPath(), OBFUSCATION_WORKER_TIMEOUT_MS);
+    await _obfuscatorPool.init();
+    console.log(`[Obfuscator] worker pool size=${size}`);
+  }
+  return _obfuscatorPool;
 }
 
-async function obfuscateJavaScript(filePath) {
+async function shutdownObfuscatorPool() {
+  if (!_obfuscatorPool) return;
+  await _obfuscatorPool.destroy();
+  _obfuscatorPool = null;
+}
+
+async function obfuscateInWorker(code, options, pool) {
+  const activePool = pool || await getObfuscatorPool();
+  return activePool.run(code, options);
+}
+
+async function obfuscateJavaScript(filePath, pool) {
   if (!fs.existsSync(filePath) || !getFeatureFlags().CAN_OBFUSCATION) return;
   if (isInWhitelist(filePath)) {
     console.log(`Skip obfuscation (whitelist): ${path.basename(filePath)}`);
@@ -725,7 +743,7 @@ async function obfuscateJavaScript(filePath) {
       const { maxRatio, label, ...options } = preset;
       const seed = crypto.randomInt(0, 1000000);
       try {
-        const result = await obfuscateInWorker(original, { ...options, seed });
+        const result = await obfuscateInWorker(original, { ...options, seed }, pool);
         const ratio = result.length / originalSize;
         if (ratio <= maxRatio) {
           bestCode = result;
@@ -757,13 +775,30 @@ async function obfuscateJavaScript(filePath) {
   );
 }
 
-async function obfuscateBundleJs(bundlePath, type) {
-  if (type === 'subpackage') {
+function collectObfuscateTargets(subpackagesDir, assetsDir) {
+  const files = [];
+  for (const bundlePath of listBundleDirs(subpackagesDir)) {
     const gameJsPath = path.join(bundlePath, 'game.js');
-    if (fs.existsSync(gameJsPath)) await obfuscateJavaScript(gameJsPath);
-  } else {
+    if (fs.existsSync(gameJsPath)) files.push(gameJsPath);
+  }
+  for (const bundlePath of listBundleDirs(assetsDir)) {
     const indexJsFile = fs.readdirSync(bundlePath).find((f) => /index(\..*)?\.js$/.test(f));
-    if (indexJsFile) await obfuscateJavaScript(path.join(bundlePath, indexJsFile));
+    if (indexJsFile) files.push(path.join(bundlePath, indexJsFile));
+  }
+  return files;
+}
+
+async function obfuscateAllBundles(subpackagesDir, assetsDir) {
+  const jsFiles = collectObfuscateTargets(subpackagesDir, assetsDir);
+  if (!jsFiles.length) return;
+
+  const pool = await getObfuscatorPool();
+  const workers = getObfuscationConcurrency();
+  console.log(`[Obfuscator] ${jsFiles.length} file(s), parallel=${workers}`);
+  try {
+    await runWithConcurrency(jsFiles, (filePath) => obfuscateJavaScript(filePath, pool), workers);
+  } finally {
+    await shutdownObfuscatorPool();
   }
 }
 
@@ -771,28 +806,18 @@ async function obfuscateBundleJs(bundlePath, type) {
 
 const PIPELINE_STEPS = 5;
 
-async function processBundles(baseDir, results, globalReplaceCommands, type) {
-  if (!fs.existsSync(baseDir)) return;
-  for (const name of fs.readdirSync(baseDir)) {
-    const bundlePath = path.join(baseDir, name);
-    if (!fs.lstatSync(bundlePath).isDirectory()) continue;
-    await processSubpackage(bundlePath, results, globalReplaceCommands);
-  }
-}
-
-async function obfuscateAllBundles(subpackagesDir, assetsDir) {
-  if (fs.existsSync(subpackagesDir)) {
-    for (const name of fs.readdirSync(subpackagesDir)) {
-      const p = path.join(subpackagesDir, name);
-      if (fs.lstatSync(p).isDirectory()) await obfuscateBundleJs(p, 'subpackage');
-    }
-  }
-  if (fs.existsSync(assetsDir)) {
-    for (const name of fs.readdirSync(assetsDir)) {
-      const p = path.join(assetsDir, name);
-      if (fs.lstatSync(p).isDirectory()) await obfuscateBundleJs(p, 'asset');
-    }
-  }
+async function processAllBundles(subpackagesDir, assetsDir, results, globalReplaceCommands) {
+  const bundlePaths = [...listBundleDirs(subpackagesDir), ...listBundleDirs(assetsDir)];
+  const bundleConcurrency = getBundleConcurrency();
+  const nativeConcurrency = getNativeConcurrency();
+  console.log(
+    `[Pipeline] bundles=${bundlePaths.length} bundleWorkers=${bundleConcurrency} nativeWorkers=${nativeConcurrency}`,
+  );
+  await runWithConcurrency(
+    bundlePaths,
+    (bundlePath) => processSubpackage(bundlePath, results, globalReplaceCommands),
+    bundleConcurrency,
+  );
 }
 
 async function main(options = {}) {
@@ -821,20 +846,17 @@ async function main(options = {}) {
   if (!fs.existsSync(sourceDir)) throw new Error('Source directory does not exist: ' + sourceDir);
   copyDirRecursive(sourceDir, processedDir);
 
-  step(3, 'Processing subpackages...');
-  await processBundles(subpackagesDir, results, globalReplaceCommands, 'subpackage');
-
-  step(4, 'Processing assets...');
-  await processBundles(assetsDir, results, globalReplaceCommands, 'asset');
+  step(3, 'Processing bundles (parallel)...');
+  await processAllBundles(subpackagesDir, assetsDir, results, globalReplaceCommands);
 
   const replaceCommandsFile = path.join(appRoot, 'replace_commands_global.json');
   fs.writeFileSync(replaceCommandsFile, JSON.stringify(globalReplaceCommands, null, 2));
-  step(5, `Saved ${globalReplaceCommands.length} replace commands`);
+  step(4, `Saved ${globalReplaceCommands.length} replace commands`);
 
   console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Applying global UUID replacements...`);
   applyReplaceCommands(processedDir, globalReplaceCommands);
 
-  console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Obfuscating bundle JavaScript...`);
+  step(5, 'Obfuscating bundle JavaScript (parallel)...');
   await obfuscateAllBundles(subpackagesDir, assetsDir);
 
   console.log(`\nSummary: ${results.length} assets processed, ${globalReplaceCommands.length} replacements`);
