@@ -364,25 +364,102 @@ function isInWhitelist(filePath) {
   return WHITELIST_CONFIG.some((pattern) => filePath.includes(pattern));
 }
 
-// ─── 图片无损重哈希 ─────────────────────────────────────────
+// ─── 图片微改色 + 重哈希（控制体积）────────────────────────
+
+const IMAGE_MAX_SIZE_RATIO = 1.2;
+
+function randomColorModulation() {
+  return {
+    hue: crypto.randomInt(-6, 7),
+    brightness: 1 + crypto.randomInt(-3, 4) / 100,
+    saturation: 1 + crypto.randomInt(-6, 7) / 100,
+  };
+}
+
+function buildImageEncodeAttempts(ext, meta) {
+  if (ext === '.jpg' || ext === '.jpeg') {
+    return [92, 88, 85, 82, 80, 78, 75, 72, 70].map((quality) => ({
+      format: 'jpeg',
+      options: { quality, mozjpeg: true, chromaSubsampling: '4:2:0' },
+    }));
+  }
+
+  const colors = meta.colours || meta.colors || 256;
+  const usePalette = Boolean(meta.palette) || colors <= 256;
+  const attempts = [];
+
+  if (usePalette) {
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: Math.min(colors, 256), compressionLevel: 9, effort: 10 },
+    });
+  }
+  attempts.push({
+    format: 'png',
+    options: { compressionLevel: 9, effort: 10, adaptiveFiltering: true },
+  });
+  attempts.push({
+    format: 'png',
+    options: { palette: true, colors: 256, compressionLevel: 9, effort: 10 },
+  });
+  if (colors > 128) {
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: 128, compressionLevel: 9, effort: 10 },
+    });
+  }
+  attempts.push({
+    format: 'png',
+    options: { palette: true, colors: 64, compressionLevel: 9, effort: 10 },
+  });
+  attempts.push({
+    format: 'png',
+    options: { palette: true, colors: 32, compressionLevel: 9, effort: 10, dither: 0.4 },
+  });
+
+  return attempts;
+}
 
 async function rehashImage(inputPath, outputPath) {
   await ensureDirectoryExists(outputPath);
   const ext = path.extname(inputPath).toLowerCase();
-  let pipeline = getSharp()(inputPath);
+  const originalSize = fs.statSync(inputPath).size;
+  const mod = randomColorModulation();
+  const meta = await getSharp()(inputPath).metadata();
+  const attempts = buildImageEncodeAttempts(ext, meta);
+  const sizeLimit = Math.ceil(originalSize * IMAGE_MAX_SIZE_RATIO);
 
-  if (getFeatureFlags().CAN_IMAGE_SWITCH) {
-    const compressionLevel = crypto.randomInt(0, 10);
-    if (ext === '.png') {
-      pipeline = pipeline.png({ compressionLevel, adaptiveFiltering: true });
-    } else if (ext === '.jpg' || ext === '.jpeg') {
-      pipeline = pipeline.jpeg({ quality: 100, mozjpeg: true });
+  let bestBuffer = null;
+  let bestSize = Infinity;
+
+  for (const attempt of attempts) {
+    let pipeline = getSharp()(inputPath).modulate(mod);
+    pipeline = attempt.format === 'jpeg'
+      ? pipeline.jpeg(attempt.options)
+      : pipeline.png(attempt.options);
+    const buffer = await pipeline.toBuffer();
+
+    if (buffer.length <= sizeLimit) {
+      await fs.writeFile(outputPath, buffer);
+      return;
+    }
+    if (buffer.length < bestSize) {
+      bestSize = buffer.length;
+      bestBuffer = buffer;
     }
   }
 
-  // toBuffer 释放输入文件句柄，避免 Windows 上 unlink EPERM
-  const buffer = await pipeline.toBuffer();
-  await fs.writeFile(outputPath, buffer);
+  if (bestBuffer) {
+    await fs.writeFile(outputPath, bestBuffer);
+    if (bestSize > sizeLimit) {
+      console.warn(
+        `Image over ${IMAGE_MAX_SIZE_RATIO}x limit: ${path.basename(inputPath)} ${originalSize}→${bestSize}B`,
+      );
+    }
+    return;
+  }
+
+  throw new Error(`Image encode failed: ${path.basename(inputPath)}`);
 }
 
 async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
