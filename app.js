@@ -118,13 +118,13 @@ async function processAudioFile(inputPath, outputPath, quality = 'medium') {
   try {
     await compressAudioFile(outputPath, compressedPath, quality);
     const compressedSize = fs.statSync(compressedPath).size;
-    fs.unlinkSync(outputPath);
+    await removeFileWithRetry(outputPath);
     fs.renameSync(compressedPath, outputPath);
     console.log(
       `Audio compressed: ${path.basename(outputPath)} (${((1 - compressedSize / originalSize) * 100).toFixed(1)}% saved)`
     );
   } catch (err) {
-    if (fs.existsSync(compressedPath)) fs.unlinkSync(compressedPath);
+    if (fs.existsSync(compressedPath)) await removeFileWithRetry(compressedPath).catch(() => {});
     console.warn(`Audio compress failed, kept copy: ${err.message}`);
   }
 }
@@ -192,6 +192,40 @@ function extractUUIDAndExtra(baseName) {
 
 async function ensureDirectoryExists(filePath) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
+}
+
+async function removeFileWithRetry(filePath, retries = 8, delayMs = 150) {
+  if (!fs.existsSync(filePath)) return;
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      await fs.promises.rm(filePath, { force: true, maxRetries: 3, retryDelay: 100 });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'EBUSY')) {
+        await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+        try {
+          fs.chmodSync(filePath, 0o666);
+        } catch (_) { /* ignore */ }
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+async function runWithConcurrency(items, worker, limit = 4) {
+  let index = 0;
+  async function next() {
+    while (index < items.length) {
+      const i = index++;
+      await worker(items[i], i);
+    }
+  }
+  const workers = Math.min(limit, items.length || 1);
+  await Promise.all(Array.from({ length: workers }, () => next()));
 }
 
 function copyDirRecursive(src, dest) {
@@ -278,10 +312,14 @@ async function rehashImage(inputPath, outputPath) {
     }
   }
 
-  await pipeline.toFile(outputPath);
+  // toBuffer 释放输入文件句柄，避免 Windows 上 unlink EPERM
+  const buffer = await pipeline.toBuffer();
+  await fs.writeFile(outputPath, buffer);
 }
 
 async function moveNativeFile(inputPath, outputPath, fileExt) {
+  if (path.resolve(inputPath) === path.resolve(outputPath)) return;
+
   await ensureDirectoryExists(outputPath);
   try {
     if (FILE_EXTENSIONS.IMAGE.includes(fileExt)) {
@@ -295,19 +333,23 @@ async function moveNativeFile(inputPath, outputPath, fileExt) {
     } else {
       await fs.copy(inputPath, outputPath);
     }
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    await removeFileWithRetry(inputPath);
   } catch (err) {
     console.warn(`Native file process failed, fallback copy: ${inputPath} → ${err.message}`);
     if (!fs.existsSync(outputPath)) {
       await fs.copy(inputPath, outputPath);
     }
-    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    try {
+      await removeFileWithRetry(inputPath);
+    } catch (unlinkErr) {
+      console.warn(`Could not remove source file (safe to ignore): ${path.basename(inputPath)} → ${unlinkErr.message}`);
+    }
   }
 }
 
 // ─── JSON 迁移 ──────────────────────────────────────────────
 
-function migrateImportJson(subpackageDir, uuidAndExtra, renamedUUID, firstTwoChars) {
+async function migrateImportJson(subpackageDir, uuidAndExtra, renamedUUID, firstTwoChars) {
   const originalFirstTwoChars = uuidAndExtra.uuid.substring(0, 2);
   const importSubDir = path.join(subpackageDir, 'import', originalFirstTwoChars);
   if (!fs.existsSync(importSubDir)) return;
@@ -337,7 +379,7 @@ function migrateImportJson(subpackageDir, uuidAndExtra, renamedUUID, firstTwoCha
     }
     const newJsonPath = path.join(newImportSubDir, newJsonFileName);
     fs.copyFileSync(jsonFilePath, newJsonPath);
-    fs.unlinkSync(jsonFilePath);
+    await removeFileWithRetry(jsonFilePath);
     console.log(`Migrated JSON: ${path.basename(newJsonPath)}`);
   }
 
@@ -400,7 +442,7 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
   console.log(`Processing: ${file} → ${plan.newFileName}`);
   await moveNativeFile(originalPath, newPath, fileExt);
 
-  migrateImportJson(subpackageDir, uuidAndExtra, plan.renamedUUID, firstTwoChars);
+  await migrateImportJson(subpackageDir, uuidAndExtra, plan.renamedUUID, firstTwoChars);
 
   const cmd = { search: plan.searchString, replace: plan.replaceString, hasAt: plan.hasAt };
   globalReplaceCommands.push(cmd);
@@ -430,11 +472,15 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands) 
     if (!fs.lstatSync(currentNativeSubDir).isDirectory()) continue;
     nativeSubDirs.add(currentNativeSubDir);
     for (const file of fs.readdirSync(currentNativeSubDir)) {
-      tasks.push(processOneAsset(subpackageDir, currentNativeSubDir, file, globalReplaceCommands, results));
+      tasks.push({ subpackageDir, currentNativeSubDir, file });
     }
   }
 
-  await Promise.all(tasks);
+  await runWithConcurrency(
+    tasks,
+    (task) => processOneAsset(task.subpackageDir, task.currentNativeSubDir, task.file, globalReplaceCommands, results),
+    4,
+  );
   for (const subDirPath of nativeSubDirs) removeEmptyDir(subDirPath);
   console.log(`[Bundle] ${subpackageName} done (${tasks.length} assets)`);
 }
