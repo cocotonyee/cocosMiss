@@ -1,0 +1,1 @@
+window._CCSettings={platform:"bytedance",groupList:["default"],collisionMatrix:[[true]],hasResourcesBundle:true,hasStartSceneBundle:false,remoteBundles:[],subpackages:[],launchScene:"db://assets/scence/loading.fire",orientation:"portrait",server:"",jsList:[]};

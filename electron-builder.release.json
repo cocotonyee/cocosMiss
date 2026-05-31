@@ -1,0 +1,63 @@
+{
+  "appId": "com.milfun.cocos",
+  "productName": "MilFun",
+  "copyright": "Copyright © MilFun",
+  "electronDist": "node_modules/electron/dist",
+  "directories": {
+    "output": "dist"
+  },
+  "files": [
+    "!app.js",
+    "!license.js",
+    "!collect.js",
+    "!scripts/**/*",
+    "!license-keys/**/*",
+    "!src/**/*",
+    "!src_processed/**/*",
+    "!dist/**/*",
+    "!README.md",
+    "loader-core.js",
+    "app.jsc",
+    "config.js",
+    "license-service.js",
+    "electron/**/*",
+    "node_modules/**/*",
+    "package.json"
+  ],
+  "asarUnpack": [
+    "**/*.node",
+    "node_modules/sharp/**/*",
+    "node_modules/@img/**/*",
+    "node_modules/bytenode/**/*",
+    "app.jsc",
+    "loader-core.js",
+    "config.js",
+    "license-service.js",
+    "electron/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "public.key",
+      "to": "."
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "MilFun"
+  },
+  "mac": {
+    "target": ["dmg"],
+    "category": "public.app-category.developer-tools"
+  }
+}

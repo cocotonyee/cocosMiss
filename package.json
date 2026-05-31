@@ -1,0 +1,30 @@
+{
+  "name": "milfun-cocos-system",
+  "version": "1.0.0",
+  "description": "A game process system for Cocos games",
+  "main": "electron/main.js",
+  "author": "MilFun",
+  "license": "MIT",
+  "scripts": {
+    "start": "node app.js",
+    "collect": "node collect.js",
+    "license": "node license.js",
+    "fingerprint": "node app.js --fingerprint",
+    "electron": "electron .",
+    "electron:dev": "electron .",
+    "build:release": "node scripts/build-release.js --mac",
+    "build:release:win": "node scripts/build-release.js --win"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "bytenode": "^1.5.7",
+    "fs-extra": "^11.3.2",
+    "javascript-obfuscator": "^4.1.1",
+    "sharp": "^0.34.3",
+    "systeminformation": "^5.27.10"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}

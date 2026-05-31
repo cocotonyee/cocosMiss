@@ -1,0 +1,382 @@
+const { app, BrowserWindow, ipcMain, dialog, shell, utilityProcess } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const fse = require('fs-extra');
+const { ensureDependencies, getProjectRoot } = require('./deps');
+const licenseService = require('../license-service');
+const { shouldForwardLogToUI } = require('./log-filter');
+const { resolveUnpackPath } = require('./worker-path');
+
+let mainWindow = null;
+let isProcessing = false;
+let activeWorker = null;
+let depsReady = false;
+
+function getResourcesRoot() {
+  if (app.isPackaged) return process.resourcesPath;
+  return getProjectRoot();
+}
+
+function getExeDir() {
+  if (app.isPackaged) return path.dirname(process.execPath);
+  return getProjectRoot();
+}
+
+function getLicenseDir() {
+  const dir = path.join(app.getPath('documents'), 'MilFun');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getWorkDir() {
+  if (app.isPackaged) {
+    const dir = path.join(app.getPath('userData'), 'work');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  return getProjectRoot();
+}
+
+function isDirWritable(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const test = path.join(dir, `.milfun-write-test-${process.pid}`);
+    fs.writeFileSync(test, 'ok');
+    fs.unlinkSync(test);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 程序工作目录：开发=项目根；安装版=exe 旁（可写）或 userData/work */
+function getWorkspaceDir() {
+  if (!app.isPackaged) return getProjectRoot();
+  const exeDir = getExeDir();
+  if (isDirWritable(exeDir)) return exeDir;
+  return getWorkDir();
+}
+
+function getOutputDir() {
+  return getWorkspaceDir();
+}
+
+function getDefaultSourceDir() {
+  return path.join(getWorkspaceDir(), 'src');
+}
+
+async function stageSourceToWorkspace(externalSource) {
+  const workspace = getWorkspaceDir();
+  const localSrc = path.join(workspace, 'src');
+  const resolvedExternal = path.resolve(externalSource);
+  const resolvedLocal = path.resolve(localSrc);
+
+  if (resolvedExternal === resolvedLocal) {
+    return localSrc;
+  }
+
+  send('log', { level: 'info', message: `正在复制源码到程序目录: ${localSrc}` });
+  send('progress', { step: 0, total: 6, message: '正在复制源码到程序目录...' });
+
+  const tempSrc = path.join(workspace, '.src-staging');
+  await fse.remove(tempSrc);
+  await fse.copy(externalSource, tempSrc);
+  await fse.remove(localSrc);
+  await fse.move(tempSrc, localSrc);
+  return localSrc;
+}
+
+function setupCoreEnv() {
+  process.env.MILFUN_APP_ROOT = getResourcesRoot();
+  process.env.MILFUN_EXE_DIR = getExeDir();
+  process.env.MILFUN_LICENSE_DIR = getLicenseDir();
+}
+
+function getAppRoot() {
+  if (app.isPackaged) return app.getAppPath();
+  return getProjectRoot();
+}
+
+function getWorkerEnv() {
+  setupCoreEnv();
+  return {
+    MILFUN_APP_ROOT: getResourcesRoot(),
+    MILFUN_EXE_DIR: getExeDir(),
+    MILFUN_LICENSE_DIR: getLicenseDir(),
+    MILFUN_CORE_ROOT: getAppRoot(),
+  };
+}
+
+function getWorkerCwd() {
+  if (app.isPackaged) return getResourcesRoot();
+  return getProjectRoot();
+}
+
+function getWorkerScript(name) {
+  const scriptPath = resolveUnpackPath(__dirname, name);
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`找不到 worker 脚本: ${scriptPath}`);
+  }
+  return scriptPath;
+}
+
+function send(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+function runPipelineInWorker(options) {
+  return new Promise((resolve, reject) => {
+    const workerPath = getWorkerScript('pipeline-worker.js');
+    let settled = false;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      activeWorker = null;
+      fn(value);
+    };
+
+    const child = utilityProcess.fork(workerPath, [], {
+      serviceName: 'MilFun Pipeline',
+      env: getWorkerEnv(),
+      stdio: 'pipe',
+      cwd: getWorkerCwd(),
+    });
+    activeWorker = child;
+
+    child.stdout?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) send('log', { level: 'warn', message: text });
+    });
+
+    child.stderr?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) send('log', { level: 'error', message: text });
+    });
+
+    child.on('message', (msg) => {
+      if (!msg || !msg.type) return;
+      if (msg.type === 'log' && shouldForwardLogToUI(msg.level, msg.message)) {
+        send('log', { level: msg.level, message: msg.message });
+      }
+      if (msg.type === 'progress') {
+        send('progress', { step: msg.step, total: msg.total, message: msg.message });
+      }
+      if (msg.type === 'done') {
+        send('done', {
+          zipPath: msg.zipPath,
+          processedDir: msg.processedDir,
+          workspaceDir: getWorkspaceDir(),
+        });
+        finish(resolve, {
+          ok: true,
+          zipPath: msg.zipPath,
+          processedDir: msg.processedDir,
+          workspaceDir: getWorkspaceDir(),
+        });
+      }
+      if (msg.type === 'error') {
+        send('error', { message: msg.message });
+        finish(reject, new Error(msg.message));
+      }
+    });
+
+    child.on('exit', (code) => {
+      if (!settled) {
+        const err = new Error(code === 0 ? '处理进程意外退出' : `处理进程异常退出 (${code})`);
+        send('error', { message: err.message });
+        finish(reject, err);
+      }
+    });
+
+    child.on('spawn', () => {
+      child.postMessage({
+        type: 'run',
+        env: getWorkerEnv(),
+        coreRoot: getAppRoot(),
+        appRoot: getWorkspaceDir(),
+        sourceDir: options.sourceDir,
+        processedDir: options.processedDir,
+        outputDir: options.outputDir,
+      });
+    });
+  });
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 300,
+    height: 480,
+    minWidth: 260,
+    minHeight: 380,
+    maxWidth: 400,
+    title: 'MilFun',
+    backgroundColor: '#0d0d0d',
+    resizable: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+    },
+    show: false,
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.once('ready-to-show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, code, desc) => {
+    dialog.showErrorBox('界面加载失败', `${desc} (${code})`);
+  });
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+async function bootstrap() {
+  createWindow();
+
+  if (!app.isPackaged) {
+    send('setup-start', {});
+    try {
+      await ensureDependencies((line) => {
+        send('setup-log', { message: line });
+      });
+      depsReady = true;
+      send('setup-done', {});
+    } catch (err) {
+      send('setup-error', { message: err.message || String(err) });
+      dialog.showErrorBox(
+        '依赖安装失败',
+        `${err.message || err}\n\n请在项目目录打开终端，手动执行：\nnpm install`,
+      );
+    }
+  } else {
+    depsReady = true;
+    send('setup-done', {});
+  }
+}
+
+ipcMain.handle('get-app-info', async () => ({
+  resourcesRoot: getResourcesRoot(),
+  licenseDir: getLicenseDir(),
+  workspaceDir: getWorkspaceDir(),
+  outputDir: getOutputDir(),
+  defaultSource: getDefaultSourceDir(),
+  isPackaged: app.isPackaged,
+  depsReady,
+}));
+
+ipcMain.handle('check-license', async (_event, options = {}) => {
+  if (!depsReady) return { valid: false, reason: '依赖尚未就绪' };
+  try {
+    setupCoreEnv();
+    return await licenseService.checkLicense(getResourcesRoot(), options);
+  } catch (err) {
+    return { valid: false, reason: err.message || String(err) };
+  }
+});
+
+ipcMain.handle('get-fingerprint', async () => {
+  if (!depsReady) throw new Error('依赖尚未就绪');
+  setupCoreEnv();
+  return licenseService.getDeviceFingerprint();
+});
+
+ipcMain.handle('import-license', async () => {
+  if (!depsReady) return { ok: false, error: '依赖尚未就绪' };
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '导入许可证文件',
+    properties: ['openFile'],
+    filters: [{ name: 'License', extensions: ['lic'] }],
+    defaultPath: getLicenseDir(),
+  });
+  if (result.canceled || !result.filePaths.length) {
+    return { ok: false, canceled: true };
+  }
+
+  setupCoreEnv();
+  const target = await licenseService.importLicense(result.filePaths[0], getResourcesRoot());
+  const license = await licenseService.checkLicense(getResourcesRoot(), { skipDevice: true });
+  return { ok: license.valid, path: target, license };
+});
+
+ipcMain.handle('select-source-dir', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 Cocos 构建产物目录',
+    properties: ['openDirectory'],
+    defaultPath: getDefaultSourceDir(),
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('open-path', async (_event, targetPath) => {
+  if (!targetPath || !fs.existsSync(targetPath)) return false;
+  await shell.openPath(targetPath);
+  return true;
+});
+
+ipcMain.handle('start-processing', async (_event, sourceDir) => {
+  if (!depsReady) {
+    return { ok: false, error: '依赖尚未就绪，请等待 npm install 完成' };
+  }
+  if (isProcessing) {
+    return { ok: false, error: '正在处理中，请稍候...' };
+  }
+
+  const resolvedSource = sourceDir || getDefaultSourceDir();
+  if (!fs.existsSync(resolvedSource)) {
+    return { ok: false, error: `源码目录不存在: ${resolvedSource}` };
+  }
+
+  isProcessing = true;
+  send('processing-state', { running: true });
+  send('progress', { step: 0, total: 6, message: '正在启动...' });
+  send('log', { level: 'info', message: 'MilFun Start...' });
+
+  try {
+    const stagedSource = await stageSourceToWorkspace(resolvedSource);
+    const workspace = getWorkspaceDir();
+    return await runPipelineInWorker({
+      sourceDir: stagedSource,
+      processedDir: path.join(workspace, 'src_processed'),
+      outputDir: workspace,
+    });
+  } catch (error) {
+    const message = error.message || String(error);
+    send('log', { level: 'error', message });
+    return { ok: false, error: message };
+  } finally {
+    isProcessing = false;
+    send('processing-state', { running: false });
+  }
+});
+
+app.whenReady().then(bootstrap);
+
+process.on('uncaughtException', (err) => {
+  try {
+    const logPath = path.join(app.getPath('userData'), 'startup-error.log');
+    fs.appendFileSync(logPath, `${new Date().toISOString()} uncaughtException\n${err.stack || err.message}\n`);
+  } catch (_) { /* ignore */ }
+  dialog.showErrorBox('MilFun 启动错误', err.message || String(err));
+});
+
+app.on('before-quit', () => {
+  if (activeWorker) {
+    activeWorker.kill();
+    activeWorker = null;
+  }
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) bootstrap();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
