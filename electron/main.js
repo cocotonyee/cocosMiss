@@ -4,7 +4,7 @@ const fs = require('fs');
 const fse = require('fs-extra');
 const { ensureDependencies, getProjectRoot } = require('./deps');
 const licenseService = require('../license-service');
-const { resolveUnpackPath } = require('./worker-path');
+const { resolveUnpackPath, resolveCoreRoot } = require('./worker-path');
 
 let mainWindow = null;
 let isProcessing = false;
@@ -171,12 +171,18 @@ function getAppRoot() {
   return getProjectRoot();
 }
 
+function getCoreRoot() {
+  return resolveCoreRoot(getAppRoot());
+}
+
 function getWorkerEnv() {
   setupCoreEnv();
   const resources = getResourcesRoot();
+  const coreRoot = getCoreRoot();
   const modulePaths = [
     path.join(resources, 'app.asar.unpacked', 'node_modules'),
     path.join(resources, 'app.asar', 'node_modules'),
+    path.join(coreRoot, 'node_modules'),
   ].filter((p) => fs.existsSync(p));
   const nodePath = [...modulePaths, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
 
@@ -184,7 +190,7 @@ function getWorkerEnv() {
     MILFUN_APP_ROOT: resources,
     MILFUN_EXE_DIR: getExeDir(),
     MILFUN_LICENSE_DIR: getLicenseDir(),
-    MILFUN_CORE_ROOT: getAppRoot(),
+    MILFUN_CORE_ROOT: coreRoot,
     MILFUN_IN_WORKER: '1',
     NODE_PATH: nodePath,
   };
@@ -272,23 +278,33 @@ function runPipelineInWorker(options) {
 
     child.on('exit', (code) => {
       if (!settled) {
-        const err = new Error(code === 0 ? '处理进程意外退出' : `处理进程异常退出 (${code})`);
+        const err = new Error(code === 0 ? '处理进程意外退出' : `处理进程异常退出 (code=${code})`);
+        send('log', { level: 'error', message: err.message });
         send('error', { message: err.message });
         finish(reject, err);
       }
     });
 
     child.on('spawn', () => {
-      logLine('info', '[Worker] 进程已启动');
-      child.postMessage({
-        type: 'run',
-        env: getWorkerEnv(),
-        coreRoot: resolveCoreRoot(getAppRoot()),
-        appRoot: getWorkspaceDir(),
-        sourceDir: options.sourceDir,
-        processedDir: options.processedDir,
-        outputDir: options.outputDir,
-      });
+      try {
+        logLine('info', '[Worker] 进程已启动');
+        const payload = {
+          type: 'run',
+          env: getWorkerEnv(),
+          coreRoot: getCoreRoot(),
+          appRoot: getWorkspaceDir(),
+          sourceDir: options.sourceDir,
+          processedDir: options.processedDir,
+          outputDir: options.outputDir,
+        };
+        logLine('info', `[Worker] coreRoot: ${payload.coreRoot}`);
+        child.postMessage(payload);
+      } catch (err) {
+        const message = err.stack || err.message || String(err);
+        logLine('error', `[Worker] 启动消息失败: ${message}`);
+        send('error', { message });
+        finish(reject, err);
+      }
     });
   });
 }

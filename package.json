@@ -12,8 +12,9 @@
     "fingerprint": "node app.js --fingerprint",
     "electron": "electron .",
     "electron:dev": "electron .",
-    "build:release": "node scripts/build-release.js --mac",
-    "build:release:win": "node scripts/build-release.js --win"
+    "build:release": "node scripts/validate-electron.js && node scripts/build-release.js --mac",
+    "build:release:win": "node scripts/validate-electron.js && node scripts/build-release.js --win",
+    "validate:electron": "node scripts/validate-electron.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
