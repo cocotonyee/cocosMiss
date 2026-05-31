@@ -142,7 +142,7 @@ async function stageSourceToWorkspace(externalSource) {
     await removeDir(tempSrc);
 
     logLine('info', '[源码] 开始复制（大项目可能需要数分钟）...');
-    send('progress', { step: 0, total: 6, message: '正在复制源码...' });
+    send('progress', { step: 0, total: 5, message: '正在复制源码...' });
     await copyWithProgress(externalSource, tempSrc);
 
     logLine('info', '[源码] 清理旧 src...');
@@ -207,13 +207,13 @@ async function runPipelineInMain(options) {
 
   const coreRoot = getCoreRoot();
   logLine('info', `[Core] 主进程加载: ${coreRoot}`);
-  send('progress', { step: 0, total: 6, message: '正在加载核心模块...' });
+  send('progress', { step: 0, total: 5, message: '正在加载核心模块...' });
 
   await new Promise((resolve) => setImmediate(resolve));
 
   const core = loadCore(coreRoot, (level, message) => logLine(level, message));
 
-  send('progress', { step: 0, total: 6, message: '正在处理资源...' });
+  send('progress', { step: 0, total: 5, message: '正在处理资源...' });
 
   const result = await core.runPipeline({
     appRoot: options.appRoot,
@@ -230,14 +230,16 @@ async function runPipelineInMain(options) {
   });
 
   send('done', {
-    zipPath: result.zipPath,
     processedDir: result.processedDir,
     workspaceDir: getWorkspaceDir(),
   });
 
+  if (result.processedDir && fs.existsSync(result.processedDir)) {
+    await shell.openPath(result.processedDir);
+  }
+
   return {
     ok: true,
-    zipPath: result.zipPath,
     processedDir: result.processedDir,
     workspaceDir: getWorkspaceDir(),
   };
@@ -307,6 +309,7 @@ ipcMain.handle('get-app-info', async () => ({
   licenseDir: getLicenseDir(),
   workspaceDir: getWorkspaceDir(),
   outputDir: getOutputDir(),
+  processedDir: path.join(getWorkspaceDir(), 'src_processed'),
   defaultSource: getDefaultSourceDir(),
   isPackaged: app.isPackaged,
   depsReady,
@@ -377,7 +380,7 @@ ipcMain.handle('start-processing', async (_event, sourceDir) => {
 
   isProcessing = true;
   send('processing-state', { running: true });
-  send('progress', { step: 0, total: 6, message: '正在启动...' });
+  send('progress', { step: 0, total: 5, message: '正在启动...' });
   send('log', { level: 'info', message: 'MilFun Start...' });
 
   try {

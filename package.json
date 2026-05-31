@@ -17,12 +17,16 @@
     "validate:electron": "node scripts/validate-electron.js"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
     "bytenode": "^1.5.7",
     "fs-extra": "^11.3.2",
     "javascript-obfuscator": "^4.1.1",
     "sharp": "^0.34.3",
     "systeminformation": "^5.27.10"
+  },
+  "overrides": {
+    "chalk": {
+      "ansi-styles": "4.3.0"
+    }
   },
   "devDependencies": {
     "electron": "^33.2.0",

@@ -7,7 +7,6 @@ const settingsPopover = document.getElementById('settings-popover');
 const btnImportLicense = document.getElementById('btn-import-license');
 const btnFingerprint = document.getElementById('btn-fingerprint');
 const btnStart = document.getElementById('btn-start');
-const btnOpenOutput = document.getElementById('btn-open-output');
 const logOutput = document.getElementById('log-output');
 const progressFill = document.getElementById('progress-fill');
 const progressPercent = document.getElementById('progress-percent');
@@ -15,8 +14,7 @@ const setupOverlay = document.getElementById('setup-overlay');
 const setupLog = document.getElementById('setup-log');
 
 let sourcePath = '';
-let workspaceDir = '';
-let lastZipPath = '';
+let processedDir = '';
 let licenseValid = false;
 let isProcessing = false;
 let appReady = false;
@@ -109,19 +107,15 @@ function bindEvents() {
     if (running) closeSettingsPopover();
   });
 
-  window.milfun.onDone(({ zipPath, workspaceDir: wsDir }) => {
-    lastZipPath = zipPath;
-    if (wsDir) workspaceDir = wsDir;
-    const name = zipPath.split(/[/\\]/).pop();
-    appendLog('success', `ZIP created: ${name}`);
-    btnOpenOutput.disabled = false;
-    btnOpenOutput.classList.remove('hidden');
-    setProgress(6, 6);
+  window.milfun.onDone(({ processedDir: outDir }) => {
+    if (outDir) processedDir = outDir;
+    appendLog('success', '处理完成，已打开 src_processed');
+    setProgress(5, 5);
   });
 
   window.milfun.onError(({ message }) => {
     appendLog('error', message);
-    setProgress(0, 6);
+    setProgress(0, 5);
   });
 
   document.addEventListener('click', (e) => {
@@ -167,26 +161,20 @@ function bindEvents() {
 
   btnStart.addEventListener('click', async () => {
     logOutput.innerHTML = '';
-    lastZipPath = '';
-    btnOpenOutput.disabled = true;
-    btnOpenOutput.classList.add('hidden');
-    setProgress(0, 6);
+    processedDir = '';
+    setProgress(0, 5);
     appendLog('info', 'MilFun Start...');
     const result = await window.milfun.startProcessing(sourcePath);
     if (!result.ok) {
       appendLog('error', result.error);
-      setProgress(0, 6);
+      setProgress(0, 5);
     }
-  });
-
-  btnOpenOutput.addEventListener('click', async () => {
-    await window.milfun.openPath(workspaceDir);
   });
 }
 
 async function initApp() {
   const info = await window.milfun.getAppInfo();
-  workspaceDir = info.workspaceDir || info.outputDir;
+  processedDir = info.processedDir || '';
   sourcePath = info.defaultSource;
   sourceDisplay.textContent = shortPath(sourcePath);
   appReady = info.depsReady;

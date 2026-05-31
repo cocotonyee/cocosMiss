@@ -33,15 +33,15 @@ onCommand(async (msg) => {
 
     require('./worker-bootstrap');
 
-    emit({ type: 'progress', step: 0, total: 6, message: '正在启动处理进程...' });
+    emit({ type: 'progress', step: 0, total: 5, message: '正在启动处理进程...' });
     emit({ type: 'log', level: 'info', message: 'MilFun Start...' });
-    emit({ type: 'progress', step: 0, total: 6, message: '正在加载核心模块...' });
+    emit({ type: 'progress', step: 0, total: 5, message: '正在加载核心模块...' });
 
     const core = loadCore(msg.coreRoot, (level, message) => {
       emit({ type: 'log', level, message });
     });
 
-    emit({ type: 'progress', step: 0, total: 6, message: '正在处理资源...' });
+    emit({ type: 'progress', step: 0, total: 5, message: '正在处理资源...' });
 
     const result = await core.runPipeline({
       appRoot: msg.appRoot,
@@ -60,7 +60,6 @@ onCommand(async (msg) => {
 
     emit({
       type: 'done',
-      zipPath: result.zipPath,
       processedDir: result.processedDir,
     });
     process.exit(0);

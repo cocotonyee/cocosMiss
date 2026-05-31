@@ -11,14 +11,32 @@ function getSharp() {
 
 let _JavaScriptObfuscator;
 function getObfuscator() {
-  if (!_JavaScriptObfuscator) _JavaScriptObfuscator = require('javascript-obfuscator');
-  return _JavaScriptObfuscator;
-}
+  if (!_JavaScriptObfuscator) {
+    const Module = require('module');
+    const obfPkgPath = require.resolve('javascript-obfuscator/package.json');
+    const obfDir = path.dirname(obfPkgPath);
+    const origResolve = Module._resolveFilename;
 
-let _archiver;
-function getArchiver() {
-  if (!_archiver) _archiver = require('archiver');
-  return _archiver;
+    Module._resolveFilename = function patchedResolve(request, parent, isMain, options) {
+      if (request === 'ansi-styles' && parent?.filename?.includes(`${path.sep}chalk${path.sep}`)) {
+        const candidates = [
+          path.join(obfDir, 'node_modules', 'chalk', 'node_modules', 'ansi-styles', 'index.js'),
+          path.join(obfDir, 'node_modules', 'ansi-styles', 'index.js'),
+        ];
+        for (const candidate of candidates) {
+          if (fs.existsSync(candidate)) return candidate;
+        }
+      }
+      return origResolve.call(this, request, parent, isMain, options);
+    };
+
+    try {
+      _JavaScriptObfuscator = require('javascript-obfuscator');
+    } finally {
+      Module._resolveFilename = origResolve;
+    }
+  }
+  return _JavaScriptObfuscator;
 }
 
 const {
@@ -530,7 +548,7 @@ function obfuscateJavaScript(filePath) {
   }
 
   if (!bestCode) {
-    console.error(`Obfuscation failed: ${filePath}`);
+    console.warn(`Obfuscation skipped (kept original): ${filePath}`);
     return;
   }
 
@@ -550,50 +568,9 @@ async function obfuscateBundleJs(bundlePath, type) {
   }
 }
 
-// ─── 打包 ───────────────────────────────────────────────────
-
-function generateFancyZipName(baseName) {
-  const symbols = ['★', '☆', '⚡', '✨', '🎯', '🔥', '💎', '🚀'];
-  const randomSymbol = symbols[crypto.randomInt(0, symbols.length)];
-  const randomNum = crypto.randomInt(0, 1000).toString().padStart(3, '0');
-  const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  return `${baseName}_${randomSymbol}_${timestamp}_${randomNum}.zip`;
-}
-
-async function zipDirectory(sourceDir, zipPath) {
-  return new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(zipPath);
-    const archive = getArchiver()('zip', { zlib: { level: 9 } });
-    output.on('close', () => resolve(zipPath));
-    archive.on('error', reject);
-    archive.pipe(output);
-
-    function addFiles(dir, prefix = '') {
-      for (const file of fs.readdirSync(dir)) {
-        const filePath = path.join(dir, file);
-        if (fs.statSync(filePath).isDirectory()) addFiles(filePath, path.join(prefix, file));
-        else archive.file(filePath, { name: path.join(prefix, file) });
-      }
-    }
-
-    addFiles(sourceDir);
-    archive.finalize();
-  });
-}
-
-async function createFinalZip(processedDir, outputDir) {
-  const outDir = outputDir || path.dirname(processedDir);
-  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-  const zipFileName = generateFancyZipName('MilFun');
-  const zipFilePath = path.join(outDir, zipFileName);
-  console.log(`\n[6/6] Creating ZIP: ${zipFileName}`);
-  await zipDirectory(processedDir, zipFilePath);
-  const stats = fs.statSync(zipFilePath);
-  console.log(`✅ ZIP ready: ${zipFilePath} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-  return zipFilePath;
-}
-
 // ─── 主流程 ─────────────────────────────────────────────────
+
+const PIPELINE_STEPS = 5;
 
 async function processBundles(baseDir, results, globalReplaceCommands, type) {
   if (!fs.existsSync(baseDir)) return;
@@ -632,8 +609,8 @@ async function main(options = {}) {
   const assetsDir = path.join(processedDir, ASSETS_DIR);
 
   const step = (n, msg) => {
-    onProgress(n, 6, msg);
-    console.log(`[${n}/6] ${msg}`);
+    onProgress(n, PIPELINE_STEPS, msg);
+    console.log(`[${n}/${PIPELINE_STEPS}] ${msg}`);
   };
 
   console.log('\x1b[37m\x1b[44m %s \x1b[0m\x1b[37m\x1b[42m %s \x1b[0m', 'MilFun', 'Start');
@@ -655,10 +632,10 @@ async function main(options = {}) {
   fs.writeFileSync(replaceCommandsFile, JSON.stringify(globalReplaceCommands, null, 2));
   step(5, `Saved ${globalReplaceCommands.length} replace commands`);
 
-  console.log('[5/6] Applying global UUID replacements...');
+  console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Applying global UUID replacements...`);
   applyReplaceCommands(processedDir, globalReplaceCommands);
 
-  console.log('[5/6] Obfuscating bundle JavaScript...');
+  console.log(`[${PIPELINE_STEPS}/${PIPELINE_STEPS}] Obfuscating bundle JavaScript...`);
   await obfuscateAllBundles(subpackagesDir, assetsDir);
 
   console.log(`\nSummary: ${results.length} assets processed, ${globalReplaceCommands.length} replacements`);
@@ -667,22 +644,21 @@ async function main(options = {}) {
 
 async function runPipeline(options = {}) {
   const appRoot = options.appRoot || getAppRoot();
-  const outputDir = options.outputDir || appRoot;
   const licenseRoot = options.licenseRoot || process.env.MILFUN_APP_ROOT || appRoot;
   const hooks = installLogHooks(options.onLog);
   try {
     if (!options.trustUiLicense) {
-      options.onProgress?.(0, 6, '正在验证授权...');
+      options.onProgress?.(0, PIPELINE_STEPS, '正在验证授权...');
       const license = await checkLicense(licenseRoot, {});
       if (!license.valid) throw new Error(license.reason || '许可证无效');
     }
 
-    options.onProgress?.(0, 6, '开始处理...');
+    options.onProgress?.(0, PIPELINE_STEPS, '开始处理...');
     const processedDir = await main({ ...options, appRoot });
-    options.onProgress?.(6, 6, '正在打包 ZIP...');
-    const zipPath = await createFinalZip(processedDir, outputDir);
+    options.onProgress?.(PIPELINE_STEPS, PIPELINE_STEPS, '处理完成');
     console.log('\x1b[37m\x1b[44m %s \x1b[0m\x1b[37m\x1b[42m %s \x1b[0m', 'MilFun', 'Well Done!');
-    return { processedDir, zipPath };
+    console.log(`✅ Output: ${processedDir}`);
+    return { processedDir };
   } finally {
     restoreLogHooks(hooks);
   }
@@ -741,7 +717,6 @@ module.exports = {
   checkLicense,
   LicenseValidator,
   main,
-  createFinalZip,
   runPipeline,
 };
 
