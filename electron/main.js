@@ -1,10 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, utilityProcess } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, utilityProcess, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fse = require('fs-extra');
 const { ensureDependencies, getProjectRoot } = require('./deps');
 const licenseService = require('../license-service');
-const { shouldForwardLogToUI } = require('./log-filter');
 const { resolveUnpackPath } = require('./worker-path');
 
 let mainWindow = null;
@@ -65,25 +64,95 @@ function getDefaultSourceDir() {
   return path.join(getWorkspaceDir(), 'src');
 }
 
+const REMOVE_OPTS = { maxRetries: 5, retryDelay: 300 };
+
+function samePath(a, b) {
+  const pa = path.resolve(a);
+  const pb = path.resolve(b);
+  if (process.platform === 'win32') return pa.toLowerCase() === pb.toLowerCase();
+  return pa === pb;
+}
+
+function logLine(level, message) {
+  send('log', { level, message });
+}
+
+async function copyWithProgress(from, to) {
+  const started = Date.now();
+  let heartbeat = null;
+
+  const copyFilter = (srcPath) => {
+    const base = path.basename(srcPath);
+    if (base === 'node_modules' || base === '.src-staging' || base === 'src_processed') return false;
+    const resolvedDest = path.resolve(to);
+    const resolvedSrc = path.resolve(srcPath);
+    if (resolvedDest.startsWith(resolvedSrc + path.sep)) return false;
+    return true;
+  };
+
+  try {
+    heartbeat = setInterval(() => {
+      const sec = ((Date.now() - started) / 1000).toFixed(0);
+      logLine('info', `[复制] 进行中... ${sec}s`);
+    }, 3000);
+
+    await fse.copy(from, to, {
+      overwrite: true,
+      errorOnExist: false,
+      filter: copyFilter,
+    });
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
+  }
+
+  logLine('info', `[复制] 完成，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s`);
+}
+
 async function stageSourceToWorkspace(externalSource) {
   const workspace = getWorkspaceDir();
   const localSrc = path.join(workspace, 'src');
-  const resolvedExternal = path.resolve(externalSource);
-  const resolvedLocal = path.resolve(localSrc);
 
-  if (resolvedExternal === resolvedLocal) {
+  logLine('info', `[源码] 外部: ${externalSource}`);
+  logLine('info', `[源码] 工作目录: ${workspace}`);
+  logLine('info', `[源码] 目标: ${localSrc}`);
+
+  if (samePath(externalSource, localSrc)) {
+    logLine('info', '[源码] 已在程序目录，跳过复制');
     return localSrc;
   }
 
-  send('log', { level: 'info', message: `正在复制源码到程序目录: ${localSrc}` });
-  send('progress', { step: 0, total: 6, message: '正在复制源码到程序目录...' });
+  if (samePath(externalSource, workspace)) {
+    if (fs.existsSync(localSrc)) {
+      logLine('info', '[源码] 选中程序根目录，使用已有 src');
+      return localSrc;
+    }
+    throw new Error('程序目录下没有 src，请选择 Cocos 构建产物目录');
+  }
 
-  const tempSrc = path.join(workspace, '.src-staging');
-  await fse.remove(tempSrc);
-  await fse.copy(externalSource, tempSrc);
-  await fse.remove(localSrc);
-  await fse.move(tempSrc, localSrc);
-  return localSrc;
+  const tempSrc = path.join(app.getPath('temp'), `milfun-src-${Date.now()}`);
+  logLine('info', `[源码] 临时目录: ${tempSrc}`);
+
+  try {
+    logLine('info', '[源码] 清理临时目录...');
+    await fse.remove(tempSrc, REMOVE_OPTS);
+
+    logLine('info', '[源码] 开始复制（大项目可能需要数分钟）...');
+    send('progress', { step: 0, total: 6, message: '正在复制源码...' });
+    await copyWithProgress(externalSource, tempSrc);
+
+    logLine('info', '[源码] 清理旧 src...');
+    await fse.remove(localSrc, REMOVE_OPTS);
+
+    logLine('info', '[源码] 移动到程序目录...');
+    await fse.move(tempSrc, localSrc, { overwrite: true });
+
+    logLine('success', `[源码] 就绪: ${localSrc}`);
+    return localSrc;
+  } catch (err) {
+    logLine('error', `[源码] 失败: ${err.message}`);
+    await fse.remove(tempSrc, REMOVE_OPTS).catch(() => {});
+    throw err;
+  }
 }
 
 function setupCoreEnv() {
@@ -129,6 +198,7 @@ function send(channel, payload) {
 function runPipelineInWorker(options) {
   return new Promise((resolve, reject) => {
     const workerPath = getWorkerScript('pipeline-worker.js');
+    logLine('info', `[Worker] 启动: ${workerPath}`);
     let settled = false;
 
     const finish = (fn, value) => {
@@ -158,11 +228,14 @@ function runPipelineInWorker(options) {
 
     child.on('message', (msg) => {
       if (!msg || !msg.type) return;
-      if (msg.type === 'log' && shouldForwardLogToUI(msg.level, msg.message)) {
-        send('log', { level: msg.level, message: msg.message });
+      if (msg.type === 'log') {
+        send('log', { level: msg.level || 'info', message: msg.message });
       }
       if (msg.type === 'progress') {
         send('progress', { step: msg.step, total: msg.total, message: msg.message });
+        if (msg.message) {
+          send('log', { level: 'info', message: msg.message });
+        }
       }
       if (msg.type === 'done') {
         send('done', {
@@ -192,6 +265,7 @@ function runPipelineInWorker(options) {
     });
 
     child.on('spawn', () => {
+      logLine('info', '[Worker] 进程已启动');
       child.postMessage({
         type: 'run',
         env: getWorkerEnv(),
@@ -206,6 +280,8 @@ function runPipelineInWorker(options) {
 }
 
 function createWindow() {
+  Menu.setApplicationMenu(null);
+
   mainWindow = new BrowserWindow({
     width: 300,
     height: 480,
@@ -215,6 +291,7 @@ function createWindow() {
     title: 'MilFun',
     backgroundColor: '#0d0d0d',
     resizable: true,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -225,6 +302,7 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.setMenuBarVisibility(false);
   mainWindow.once('ready-to-show', () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
   });

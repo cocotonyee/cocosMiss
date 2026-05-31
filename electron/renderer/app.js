@@ -21,15 +21,6 @@ let licenseValid = false;
 let isProcessing = false;
 let appReady = false;
 
-const STEP_LABELS = {
-  1: 'Initializing...',
-  2: 'Loading resources...',
-  3: 'Processing subpackages...',
-  4: 'Processing assets...',
-  5: 'Optimizing...',
-  6: 'Creating ZIP...',
-};
-
 function shortPath(p) {
   if (!p) return './src';
   const parts = p.replace(/\\/g, '/').split('/');
@@ -50,13 +41,6 @@ function appendSetupLog(message) {
   if (!message.trim()) return;
   setupLog.textContent += (setupLog.textContent ? '\n' : '') + message;
   setupLog.scrollTop = setupLog.scrollHeight;
-}
-
-function shouldShowLog(level, message) {
-  if (level === 'error' || level === 'warn') return true;
-  if (message.includes('许可证') || message.includes('设备指纹')) return true;
-  if (message.includes('复制源码')) return true;
-  return false;
 }
 
 function setProgress(step, total) {
@@ -107,15 +91,12 @@ async function refreshLicense() {
 
 function bindEvents() {
   window.milfun.onLog(({ level, message }) => {
-    if (!shouldShowLog(level, message)) return;
     appendLog(level, message);
   });
 
-  window.milfun.onProgress(({ step, total }) => {
+  window.milfun.onProgress(({ step, total, message }) => {
     setProgress(step, total);
-    if (step > 0 && step <= 6) {
-      appendLog('info', STEP_LABELS[step] || `Step ${step}/${total}...`);
-    }
+    if (message) appendLog('info', message);
   });
 
   window.milfun.onProcessingState(({ running }) => {

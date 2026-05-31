@@ -2,7 +2,6 @@
 
 const path = require('path');
 const fs = require('fs');
-const { shouldForwardLogToUI } = require('./log-filter');
 const { resolveCoreRoot } = require('./worker-path');
 
 function emit(msg) {
@@ -70,12 +69,11 @@ onCommand(async (msg) => {
       outputDir: msg.outputDir,
       trustUiLicense: true,
       onLog: (level, message) => {
-        if (shouldForwardLogToUI(level, message)) {
-          emit({ type: 'log', level, message });
-        }
+        emit({ type: 'log', level, message });
       },
       onProgress: (step, total, message) => {
         emit({ type: 'progress', step, total, message });
+        if (message) emit({ type: 'log', level: 'info', message });
       },
     });
 
