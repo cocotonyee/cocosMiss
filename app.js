@@ -784,6 +784,24 @@ function buildImportSidecarFileName(parsed, renamedUUID, ext) {
   return `${renamedUUID}${parsed.extra ? `.${parsed.extra}` : ''}${ext}`;
 }
 
+/** Cocos config.packs 的 key 对应 import JSON，文件名不能改 */
+function readBundlePackKeys(subpackageDir) {
+  const keys = new Set();
+  const configPath = path.join(subpackageDir, 'config.json');
+  if (!fs.existsSync(configPath)) return keys;
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (config.packs && typeof config.packs === 'object') {
+      for (const key of Object.keys(config.packs)) keys.add(key);
+    }
+  } catch (_) { /* ignore */ }
+  return keys;
+}
+
+function isBundlePackImportKey(subpackageDir, importBaseName) {
+  return readBundlePackKeys(subpackageDir).has(importBaseName);
+}
+
 function listImportSidecarsForUuid(importSubDir, uuid) {
   const hits = [];
   if (!fs.existsSync(importSubDir)) return hits;
@@ -791,7 +809,7 @@ function listImportSidecarsForUuid(importSubDir, uuid) {
     const ext = path.extname(file).toLowerCase();
     if (!IMPORT_SIDECAR_EXTS.includes(ext)) continue;
     const parsed = extractUUIDAndExtra(path.basename(file, ext));
-    if (!parsed || parsed.notUUid || parsed.uuid !== uuid) continue;
+    if (!parsed || parsed.uuid !== uuid) continue;
     hits.push({ file, ext, parsed });
   }
   return hits;
@@ -1430,6 +1448,8 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
     processedUuids.add(entry.renamedUUID);
   }
 
+  const packKeys = readBundlePackKeys(subpackageDir);
+
   for (const sub of fs.readdirSync(importDir)) {
     const subPath = path.join(importDir, sub);
     if (!fs.lstatSync(subPath).isDirectory()) continue;
@@ -1439,7 +1459,9 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
       const ext = path.extname(file).toLowerCase();
       if (!IMPORT_SIDECAR_EXTS.includes(ext)) continue;
       const parsed = extractUUIDAndExtra(path.basename(file, ext));
-      if (!parsed || parsed.notUUid || processedUuids.has(parsed.uuid)) continue;
+      if (!parsed || processedUuids.has(parsed.uuid)) continue;
+      const importKey = parsed.fullName || parsed.uuid;
+      if (packKeys.has(importKey)) continue;
       if (!orphanByUuid.has(parsed.uuid)) {
         orphanByUuid.set(parsed.uuid, { parsed, file });
       } else if (ext === '.json') {
@@ -1592,7 +1614,7 @@ function buildImportUuidIndex(processedDir) {
           }
           if (!entry.endsWith('.json')) continue;
           const parsed = extractUUIDAndExtra(path.basename(entry, '.json'));
-          if (!parsed || parsed.notUUid) continue;
+          if (!parsed) continue;
           if (!isValidOutputFile(entryPath)) continue;
 
           const meta = { importPath: entryPath, bundleDir, baseUuid: parsed.uuid };

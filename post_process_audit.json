@@ -1,9 +1,14 @@
 {
-  "generatedAt": "2026-05-31T06:50:36.334Z",
+  "generatedAt": "2026-06-23T12:14:33.022Z",
   "processedDir": "/Users/alex/Lab/extJs/src_processed",
-  "assetsProcessed": 847,
+  "assetsProcessed": 657,
   "missingFiles": 0,
   "staleReferenceCount": 0,
   "staleUuids": [],
+  "fileCount": {
+    "sourceCount": 1332,
+    "processedCount": 1332,
+    "ok": true
+  },
   "hint": "校验通过，请使用 src_processed 目录作为构建产物运行"
 }
