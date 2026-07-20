@@ -219,6 +219,18 @@ function generateRandomHexString(length) {
   return result;
 }
 
+/** 生成不与 reserved 冲突的短 UUID（Cocos 压缩 9 位） */
+function generateUniqueShortUuid(reserved) {
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const id = generateRandomHexString(9);
+    if (!reserved.has(id)) {
+      reserved.add(id);
+      return id;
+    }
+  }
+  throw new Error('Failed to allocate unique short UUID');
+}
+
 function extractUUIDAndExtra(baseName) {
   const uuidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
   const lastDotIndex = baseName.lastIndexOf('.');
@@ -784,11 +796,24 @@ function buildImportSidecarFileName(parsed, renamedUUID, ext) {
   return `${renamedUUID}${parsed.extra ? `.${parsed.extra}` : ''}${ext}`;
 }
 
+/** Cocos 2.x: config.xxxxx.json；Cocos 3.x: config.json */
+function findBundleConfigPath(subpackageDir) {
+  const plain = path.join(subpackageDir, 'config.json');
+  if (fs.existsSync(plain)) return plain;
+  if (!fs.existsSync(subpackageDir)) return null;
+  for (const name of fs.readdirSync(subpackageDir)) {
+    if (/^config(\.[0-9a-f]+)?\.json$/i.test(name)) {
+      return path.join(subpackageDir, name);
+    }
+  }
+  return null;
+}
+
 /** Cocos config.packs 的 key 对应 import JSON，文件名不能改 */
 function readBundlePackKeys(subpackageDir) {
   const keys = new Set();
-  const configPath = path.join(subpackageDir, 'config.json');
-  if (!fs.existsSync(configPath)) return keys;
+  const configPath = findBundleConfigPath(subpackageDir);
+  if (!configPath) return keys;
   try {
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     if (config.packs && typeof config.packs === 'object') {
@@ -799,7 +824,12 @@ function readBundlePackKeys(subpackageDir) {
 }
 
 function isBundlePackImportKey(subpackageDir, importBaseName) {
-  return readBundlePackKeys(subpackageDir).has(importBaseName);
+  if (!importBaseName) return false;
+  const packKeys = readBundlePackKeys(subpackageDir);
+  if (packKeys.has(importBaseName)) return true;
+  // Cocos2 md5: filename is packKey.hash → 用 uuid 段匹配
+  const parsed = extractUUIDAndExtra(importBaseName);
+  return Boolean(parsed && packKeys.has(parsed.uuid));
 }
 
 function listImportSidecarsForUuid(importSubDir, uuid) {
@@ -818,6 +848,11 @@ function listImportSidecarsForUuid(importSubDir, uuid) {
 // ─── JSON / BIN import 迁移 ──────────────────────────────────
 
 async function migrateImportSidecars(subpackageDir, uuidAndExtra, plan, globalReplaceCommands, bundleRel, resultItem) {
+  // Cocos2 pack JSON 文件名必须与 config.packs key 一致，禁止迁移改名
+  if (isBundlePackImportKey(subpackageDir, uuidAndExtra.uuid)) {
+    vlog(`Skip pack import migrate: ${uuidAndExtra.uuid}`);
+    return [];
+  }
   const renamedUUID = plan.renamedUUID;
   const firstTwoChars = renamedUUID.substring(0, 2);
   const originalFirstTwoChars = uuidAndExtra.uuid.substring(0, 2);
@@ -937,8 +972,8 @@ function buildPlanReplaceCommands(plan) {
 }
 
 function patchBundleConfig(subpackageDir, plan) {
-  const configPath = path.join(subpackageDir, 'config.json');
-  if (!fs.existsSync(configPath)) return false;
+  const configPath = findBundleConfigPath(subpackageDir);
+  if (!configPath) return false;
   const content = fs.readFileSync(configPath, 'utf8');
   const next = applyReplaceToContent(content, buildPlanReplaceCommands(plan));
   if (next === content) return false;
@@ -1026,10 +1061,15 @@ function pushNativePathReplaceCommands(commands, bundleRel, nativePathSearch, na
 }
 
 function createSharedUuidState() {
-  return { uuidRegistry: new Map(), uuidReplaceDedupe: new Set() };
+  return {
+    uuidRegistry: new Map(),
+    uuidReplaceDedupe: new Set(),
+    reservedShortIds: new Set(),
+  };
 }
 
-function collectBundleAssetUuids(bundlePath) {
+function collectBundleAssetUuids(bundlePath, options = {}) {
+  const { includeShort = false, excludePackKeys = null } = options;
   const uuids = new Set();
   const scanRoot = (root) => {
     if (!fs.existsSync(root)) return;
@@ -1048,7 +1088,14 @@ function collectBundleAssetUuids(bundlePath) {
         const ext = path.extname(file).toLowerCase();
         const baseName = ext ? path.basename(file, ext) : file;
         const parsed = extractUUIDAndExtra(baseName);
-        if (parsed && !parsed.notUUid) uuids.add(parsed.uuid);
+        if (!parsed) continue;
+        if (parsed.notUUid) {
+          if (!includeShort) continue;
+          if (excludePackKeys && excludePackKeys.has(parsed.uuid)) continue;
+          uuids.add(parsed.uuid);
+        } else {
+          uuids.add(parsed.uuid);
+        }
       }
     }
   };
@@ -1060,9 +1107,19 @@ function collectBundleAssetUuids(bundlePath) {
 function preassignSharedUuids(bundlePaths, sharedUuidState) {
   let assigned = 0;
   for (const bundlePath of bundlePaths) {
-    for (const uuid of collectBundleAssetUuids(bundlePath)) {
+    const packKeys = readBundlePackKeys(bundlePath);
+    for (const id of packKeys) sharedUuidState.reservedShortIds.add(id);
+
+    for (const uuid of collectBundleAssetUuids(bundlePath, { includeShort: true, excludePackKeys: packKeys })) {
       if (sharedUuidState.uuidRegistry.has(uuid)) continue;
-      sharedUuidState.uuidRegistry.set(uuid, { renamedUUID: generateNewUUID() });
+      const isShort = /^[0-9a-f]{9}$/i.test(uuid) && !uuid.includes('-');
+      if (isShort) {
+        sharedUuidState.reservedShortIds.add(uuid);
+        const renamedUUID = generateUniqueShortUuid(sharedUuidState.reservedShortIds);
+        sharedUuidState.uuidRegistry.set(uuid, { renamedUUID });
+      } else {
+        sharedUuidState.uuidRegistry.set(uuid, { renamedUUID: generateNewUUID() });
+      }
       assigned++;
     }
   }
@@ -1073,26 +1130,44 @@ function preassignSharedUuids(bundlePaths, sharedUuidState) {
 }
 
 function resolveSharedRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath, uuidRegistry, options = {}) {
-  const existing = !uuidAndExtra.notUUid ? uuidRegistry.get(uuidAndExtra.uuid) : null;
+  const reservedShortIds = options.reservedShortIds || null;
+  const existing = uuidRegistry.get(uuidAndExtra.uuid) || null;
   const plan = buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath, {
     ...options,
     reusedRenamedUUID: existing?.renamedUUID,
+    reservedShortIds,
   });
-  if (!uuidAndExtra.notUUid && !existing) {
+  if (!existing) {
     uuidRegistry.set(uuidAndExtra.uuid, { renamedUUID: plan.renamedUUID });
+    if (uuidAndExtra.notUUid && reservedShortIds) {
+      reservedShortIds.add(uuidAndExtra.uuid);
+      reservedShortIds.add(plan.renamedUUID);
+    }
   }
   return plan;
 }
 
 function buildRenamePlan(uuidAndExtra, fileExt, originalFileName, bundleRelPath, options = {}) {
-  const { skipNativePaths = false, skipImportPaths = false, reusedRenamedUUID = null } = options;
+  const {
+    skipNativePaths = false,
+    skipImportPaths = false,
+    reusedRenamedUUID = null,
+    reservedShortIds = null,
+  } = options;
   const isNestedNative = originalFileName.includes('/');
   let originalEncryptedName;
   let encryptedRenamedName;
   let renamedUUID;
 
   if (uuidAndExtra.notUUid) {
-    renamedUUID = generateRandomHexString(9);
+    if (reusedRenamedUUID) {
+      renamedUUID = reusedRenamedUUID;
+    } else if (reservedShortIds) {
+      reservedShortIds.add(uuidAndExtra.uuid);
+      renamedUUID = generateUniqueShortUuid(reservedShortIds);
+    } else {
+      renamedUUID = generateRandomHexString(9);
+    }
     encryptedRenamedName = renamedUUID;
     originalEncryptedName = uuidAndExtra.uuid;
   } else {
@@ -1270,6 +1345,7 @@ async function processOneAsset(subpackageDir, currentNativeSubDir, file, globalR
     originalFile,
     bundleRel,
     sharedState.uuidRegistry,
+    { reservedShortIds: sharedState.reservedShortIds },
   );
   const firstTwoChars = plan.renamedUUID.substring(0, 2);
   await fs.mkdir(path.join(subpackageDir, 'native', firstTwoChars), { recursive: true });
@@ -1379,7 +1455,7 @@ async function processImportOnlyAsset(subpackageDir, importSubDir, file, uuidAnd
     file,
     bundleRel,
     sharedState.uuidRegistry,
-    { skipNativePaths: true },
+    { skipNativePaths: true, reservedShortIds: sharedState.reservedShortIds },
   );
 
   vlog(`Processing import-only: ${file} → ${plan.newFileName}`);
@@ -1444,35 +1520,51 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
     processedUuids.add(item.uuid);
     if (item.renamedUUID) processedUuids.add(item.renamedUUID);
   }
-  for (const entry of sharedState.uuidRegistry.values()) {
+  for (const [orig, entry] of sharedState.uuidRegistry.entries()) {
+    processedUuids.add(orig);
     processedUuids.add(entry.renamedUUID);
   }
 
   const packKeys = readBundlePackKeys(subpackageDir);
+  for (const key of packKeys) {
+    processedUuids.add(key);
+    sharedState.reservedShortIds.add(key);
+  }
 
+  // 先快照全部 orphan，避免处理时迁入新前缀目录被再次扫描改名
+  const orphanByUuid = new Map();
   for (const sub of fs.readdirSync(importDir)) {
     const subPath = path.join(importDir, sub);
     if (!fs.lstatSync(subPath).isDirectory()) continue;
 
-    const orphanByUuid = new Map();
     for (const file of fs.readdirSync(subPath)) {
       const ext = path.extname(file).toLowerCase();
       if (!IMPORT_SIDECAR_EXTS.includes(ext)) continue;
       const parsed = extractUUIDAndExtra(path.basename(file, ext));
       if (!parsed || processedUuids.has(parsed.uuid)) continue;
-      const importKey = parsed.fullName || parsed.uuid;
-      if (packKeys.has(importKey)) continue;
+      if (packKeys.has(parsed.uuid)) continue;
       if (!orphanByUuid.has(parsed.uuid)) {
-        orphanByUuid.set(parsed.uuid, { parsed, file });
+        orphanByUuid.set(parsed.uuid, { parsed, file, subPath });
       } else if (ext === '.json') {
-        orphanByUuid.set(parsed.uuid, { parsed, file });
+        orphanByUuid.set(parsed.uuid, { parsed, file, subPath });
       }
     }
+  }
 
-    for (const { parsed, file } of orphanByUuid.values()) {
-      processedUuids.add(parsed.uuid);
-      await processImportOnlyAsset(subpackageDir, subPath, file, parsed, globalReplaceCommands, results, bundleRel, sharedState);
-    }
+  for (const { parsed, file, subPath } of orphanByUuid.values()) {
+    processedUuids.add(parsed.uuid);
+    await processImportOnlyAsset(
+      subpackageDir,
+      subPath,
+      file,
+      parsed,
+      globalReplaceCommands,
+      results,
+      bundleRel,
+      sharedState,
+    );
+    const last = results[results.length - 1];
+    if (last?.renamedUUID) processedUuids.add(last.renamedUUID);
   }
 }
 
