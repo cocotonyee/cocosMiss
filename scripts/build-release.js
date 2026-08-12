@@ -5,6 +5,7 @@
  */
 const fs = require('fs-extra');
 const path = require('path');
+const os = require('os');
 const { execSync } = require('child_process');
 const JavaScriptObfuscator = require('javascript-obfuscator');
 const bytenode = require('bytenode');
