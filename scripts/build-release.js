@@ -38,9 +38,29 @@ const RELEASE_OBFUSCATION = {
 };
 
 function runElectronBuilder(args) {
-  execSync(`npx electron-builder --config "${BUILDER_CONFIG}" ${args}`, {
+  const env = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' };
+  // 在 macOS 上交叉打包 Windows 时，优先用已缓存的 win Electron，避免误用本机 darwin dist
+  if (String(args).includes('--win')) {
+    const candidates = [
+      process.env.ELECTRON_CUSTOM_DIST,
+      path.join(os.tmpdir(), 'electron-win32-x64'),
+      path.join(os.homedir(), 'Library/Caches/electron/win32-x64-unpacked'),
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+      if (fs.existsSync(path.join(candidate, 'electron.exe'))) {
+        env.ELECTRON_BUILDER_ELECTRON_DIST = candidate;
+        console.log(`   使用 Windows Electron: ${candidate}`);
+        break;
+      }
+    }
+  }
+  const distFlag = env.ELECTRON_BUILDER_ELECTRON_DIST
+    ? ` -c.electronDist="${env.ELECTRON_BUILDER_ELECTRON_DIST}"`
+    : '';
+  execSync(`npx electron-builder --config "${BUILDER_CONFIG}" ${args}${distFlag}`, {
     cwd: ROOT,
     stdio: 'inherit',
+    env,
   });
 }
 

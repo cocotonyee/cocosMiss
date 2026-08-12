@@ -2,7 +2,6 @@
   "appId": "com.milfun.cocos",
   "productName": "MilFun",
   "copyright": "Copyright © MilFun",
-  "electronDist": "node_modules/electron/dist",
   "directories": {
     "output": "dist"
   },
@@ -51,10 +50,13 @@
   "win": {
     "target": [
       {
-        "target": "nsis",
-        "arch": ["x64"]
+        "target": "zip",
+        "arch": [
+          "x64"
+        ]
       }
-    ]
+    ],
+    "signAndEditExecutable": false
   },
   "nsis": {
     "oneClick": false,
@@ -64,7 +66,9 @@
     "shortcutName": "MilFun"
   },
   "mac": {
-    "target": ["dmg"],
+    "target": [
+      "dmg"
+    ],
     "category": "public.app-category.developer-tools"
   }
 }
