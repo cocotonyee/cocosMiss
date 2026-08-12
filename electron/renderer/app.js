@@ -186,9 +186,9 @@ function getImageColorRanges(level) {
   const factor = intensity / 5;
   return {
     intensity,
-    hueMax: Math.max(1, Math.round(12 * factor)),
-    brightPct: Math.max(1, Math.round(8 * factor)),
-    satPct: Math.max(1, Math.round(14 * factor)),
+    hueMax: Math.max(2, Math.round(25 * factor)),
+    brightPct: Math.max(2, Math.round(15 * factor)),
+    satPct: Math.max(3, Math.round(30 * factor)),
   };
 }
 
@@ -196,7 +196,7 @@ function syncImageIntensityUi() {
   const { intensity, hueMax, brightPct, satPct } = getImageColorRanges(cfgImageIntensity.value);
   cfgImageIntensity.value = String(intensity);
   cfgImageIntensityVal.textContent = String(intensity);
-  cfgImageIntensityHint.textContent = `色相 ±${hueMax}° · 亮度 ±${brightPct}% · 饱和度 ±${satPct}%`;
+  cfgImageIntensityHint.textContent = `三方案随机 · 色相 ±${hueMax}° · 亮度 ±${brightPct}% · 饱和度 ±${satPct}%`;
   return intensity;
 }
 
@@ -226,7 +226,7 @@ function applyFeatureFlagsToUi(flags) {
   cfgImage.checked = Boolean(flags.canImageSwitch);
   cfgAudio.checked = Boolean(flags.canAudioSwitch);
   cfgObfRatio.value = String(ratioToSlider(flags.obfuscationMaxRatio ?? 1.8));
-  cfgImageIntensity.value = String(clampIntensity(flags.imageColorIntensity ?? 5));
+  cfgImageIntensity.value = String(clampIntensity(flags.imageColorIntensity ?? 7));
   syncObfRatioUi();
   syncImageIntensityUi();
   updateObfRatioState();

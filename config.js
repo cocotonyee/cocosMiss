@@ -12,7 +12,7 @@ const DEFAULTS = {
   OBFUSCATION_PREFER_RATIO: 1.5,
   OBFUSCATION_MAX_RATIO: 1.8,
   OBFUSCATION_TIER_GAP,
-  IMAGE_COLOR_INTENSITY: 5,
+  IMAGE_COLOR_INTENSITY: 7,
 };
 
 // 内置默认（兼容旧导出）
@@ -175,9 +175,10 @@ function buildImageColorRanges(intensity) {
   const factor = level / 5;
   return {
     intensity: level,
-    hueMax: Math.max(1, Math.round(12 * factor)),
-    brightPct: Math.max(1, Math.round(8 * factor)),
-    satPct: Math.max(1, Math.round(14 * factor)),
+    // 恢复更强视觉差：默认 5 ≈ 色相±25° / 亮度±15% / 饱和±30%
+    hueMax: Math.max(2, Math.round(25 * factor)),
+    brightPct: Math.max(2, Math.round(15 * factor)),
+    satPct: Math.max(3, Math.round(30 * factor)),
   };
 }
 

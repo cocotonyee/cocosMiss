@@ -434,7 +434,20 @@ const REPLACE_SKIP_DIRS = new Set([
   'polyfills.bundle',
   'system.bundle',
   'web-adapter',
+  // Cocos 引擎内置 bundle：UUID 被引擎硬编码，禁止改名/全局替换
+  'internal',
 ]);
+
+/** 禁止改名的 bundle（引擎内置资源，运行时仍按原始 UUID 加载） */
+const PROTECTED_BUNDLE_NAMES = new Set(['internal']);
+
+function isProtectedBundleName(name) {
+  return PROTECTED_BUNDLE_NAMES.has(String(name || '').toLowerCase());
+}
+
+function isProtectedBundleDir(bundlePath) {
+  return isProtectedBundleName(path.basename(bundlePath));
+}
 
 function shouldSkipReplaceDir(name) {
   return REPLACE_SKIP_DIRS.has(name);
@@ -542,71 +555,134 @@ function isInWhitelist(filePath) {
   return WHITELIST_CONFIG.some((pattern) => filePath.includes(pattern));
 }
 
-// ─── 图片改色（客户强度 + 单次编码、尽量保持体积）────────────
+// ─── 图片改色（三方案随机 + 多档编码控体积）────────────────
 
-const IMAGE_SIZE_WARN_RATIO = 0.1;
+const IMAGE_MAX_SIZE_RATIO = 1.25;
 
-function randomColorModulation() {
-  const { hueMax, brightPct, satPct } = buildImageColorRanges(getFeatureFlags().IMAGE_COLOR_INTENSITY);
+function randomSignedMagnitude(minMag, maxMag) {
+  const lo = Math.max(1, Math.min(minMag, maxMag));
+  const hi = Math.max(lo, maxMag);
+  const sign = crypto.randomInt(0, 2) ? 1 : -1;
+  return sign * crypto.randomInt(lo, hi + 1);
+}
+
+/**
+ * 三方案随机改色（旧版思路）：
+ * 0 hue   — 色相主导偏移
+ * 1 tint  — 冷暖色偏 + tint
+ * 2 punch — 高饱和 + 对比度
+ */
+function buildImageColorPlan() {
+  const ranges = buildImageColorRanges(getFeatureFlags().IMAGE_COLOR_INTENSITY);
+  const { hueMax, brightPct, satPct, intensity } = ranges;
+  const minFactor = intensity >= 8 ? 0.75 : intensity >= 5 ? 0.6 : 0.5;
+  const scheme = crypto.randomInt(0, 3);
+
+  const hueFloor = Math.max(2, Math.round(hueMax * minFactor));
+  const brightFloor = Math.max(2, Math.round(brightPct * minFactor));
+  const satFloor = Math.max(2, Math.round(satPct * minFactor));
+
+  if (scheme === 0) {
+    return {
+      scheme: 'hue',
+      intensity,
+      modulate: {
+        hue: randomSignedMagnitude(hueFloor, hueMax),
+        brightness: 1 + randomSignedMagnitude(brightFloor, brightPct) / 100,
+        saturation: 1 + randomSignedMagnitude(satFloor, satPct) / 100,
+      },
+    };
+  }
+
+  if (scheme === 1) {
+    const tintStrength = Math.min(80, 28 + intensity * 5);
+    const channel = crypto.randomInt(0, 3);
+    const tint = [0, 0, 0];
+    tint[channel] = tintStrength;
+    tint[(channel + 1) % 3] = Math.round(tintStrength * 0.25);
+    return {
+      scheme: 'tint',
+      intensity,
+      modulate: {
+        hue: randomSignedMagnitude(Math.max(2, Math.round(hueFloor * 0.45)), Math.max(3, Math.round(hueMax * 0.55))),
+        brightness: 1 + randomSignedMagnitude(brightFloor, brightPct) / 100,
+        saturation: 1 + randomSignedMagnitude(satFloor, Math.max(satFloor + 1, Math.round(satPct * 1.15))) / 100,
+      },
+      tint: { r: tint[0], g: tint[1], b: tint[2] },
+    };
+  }
+
+  const contrast = 1 + randomSignedMagnitude(Math.max(4, Math.round(brightPct * 0.7)), Math.max(6, Math.round(brightPct * 1.2))) / 100;
+  const intercept = Math.round((1 - contrast) * 128);
   return {
-    hue: crypto.randomInt(-hueMax, hueMax + 1),
-    brightness: 1 + crypto.randomInt(-brightPct, brightPct + 1) / 100,
-    saturation: 1 + crypto.randomInt(-satPct, satPct + 1) / 100,
+    scheme: 'punch',
+    intensity,
+    modulate: {
+      hue: randomSignedMagnitude(Math.max(2, Math.round(hueFloor * 0.55)), Math.max(4, Math.round(hueMax * 0.7))),
+      brightness: 1 + randomSignedMagnitude(brightFloor, brightPct) / 100,
+      saturation: 1 + randomSignedMagnitude(Math.max(satFloor, Math.round(satPct * 0.7)), Math.max(satPct, Math.round(satPct * 1.25))) / 100,
+    },
+    linear: [contrast, intercept],
   };
 }
 
-function buildImageEncodeOptions(ext, meta) {
+function buildImageEncodeAttempts(ext, meta) {
   if (ext === '.jpg' || ext === '.jpeg') {
-    let quality = 90;
-    if (Number.isFinite(meta.quality) && meta.quality > 0) {
-      quality = Math.min(100, Math.max(75, Math.round(meta.quality)));
-    }
-    const options = {
-      quality,
-      mozjpeg: true,
-      chromaSubsampling: meta.chromaSubsampling === '4:4:4' ? '4:4:4' : '4:2:0',
-    };
-    if (meta.isProgressive) options.progressive = true;
-    return { type: 'jpeg', options };
+    return [92, 88, 85, 82, 80, 78, 75, 72, 68].map((quality) => ({
+      format: 'jpeg',
+      options: { quality, mozjpeg: true, chromaSubsampling: '4:2:0' },
+    }));
   }
 
   const colors = meta.colours || meta.colors || 256;
-  const compressionLevel = Number.isFinite(meta.compression)
-    ? Math.min(9, Math.max(0, meta.compression))
-    : 9;
-
+  const usePalette = Boolean(meta.palette) || colors <= 256;
   const hasAlpha = Boolean(meta.hasAlpha || (meta.channels && meta.channels >= 4));
-  if (hasAlpha) {
-    return {
-      type: 'png',
-      options: {
-        compressionLevel,
-        effort: 1,
-        palette: false,
-      },
-    };
+  const attempts = [];
+
+  if (usePalette && !hasAlpha) {
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: Math.min(Math.max(colors, 2), 256), compressionLevel: 9, effort: 10 },
+    });
   }
 
-  if (meta.palette || colors <= 256) {
-    return {
-      type: 'png',
-      options: {
-        palette: true,
-        colors: Math.min(Math.max(colors, 2), 256),
-        compressionLevel,
-        effort: 1,
-      },
-    };
+  attempts.push({
+    format: 'png',
+    options: { compressionLevel: 9, effort: 10, adaptiveFiltering: true },
+  });
+
+  if (!hasAlpha) {
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: 256, compressionLevel: 9, effort: 10 },
+    });
+    if (colors > 128) {
+      attempts.push({
+        format: 'png',
+        options: { palette: true, colors: 128, compressionLevel: 9, effort: 10 },
+      });
+    }
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: 64, compressionLevel: 9, effort: 10 },
+    });
+    attempts.push({
+      format: 'png',
+      options: { palette: true, colors: 32, compressionLevel: 9, effort: 10, dither: 0.45 },
+    });
+  } else {
+    // 带透明通道：避免强行 palette 破坏边缘，改用压缩档位
+    attempts.push({
+      format: 'png',
+      options: { compressionLevel: 9, effort: 7, palette: false },
+    });
+    attempts.push({
+      format: 'png',
+      options: { compressionLevel: 6, effort: 4, palette: false },
+    });
   }
 
-  return {
-    type: 'png',
-    options: {
-      compressionLevel,
-      effort: 1,
-      adaptiveFiltering: false,
-    },
-  };
+  return attempts;
 }
 
 function imageHasAlpha(meta) {
@@ -651,72 +727,102 @@ function unpremultiplyRgbAfterModulate(data, channels) {
   }
 }
 
-async function rehashImageWithAlpha(inputPath, outputPath, mod, encodeOptions) {
-  const sharp = getSharp();
-  const src = sharp(inputPath, { failOn: 'none' }).ensureAlpha();
-  const alphaRaw = await src.clone().extractChannel('alpha').raw().toBuffer();
-
-  const { data, info } = await src.clone().raw().toBuffer({ resolveWithObject: true });
-  prepareRgbForAlphaModulate(data, info.channels);
-
-  const modulatedRgb = await sharp(data, {
-    raw: { width: info.width, height: info.height, channels: info.channels },
-  })
-    .removeAlpha()
-    .modulate(mod)
-    .raw()
-    .toBuffer();
-
-  const pixelCount = info.width * info.height;
-  const merged = Buffer.alloc(pixelCount * 4);
-  for (let p = 0; p < pixelCount; p++) {
-    const o = p * 4;
-    merged[o] = modulatedRgb[p * 3];
-    merged[o + 1] = modulatedRgb[p * 3 + 1];
-    merged[o + 2] = modulatedRgb[p * 3 + 2];
-    merged[o + 3] = alphaRaw[p];
+function applyColorPlanToPipeline(pipeline, plan) {
+  let next = pipeline.modulate(plan.modulate);
+  if (plan.tint) {
+    next = next.tint(plan.tint);
   }
-  unpremultiplyRgbAfterModulate(merged, 4);
+  if (plan.linear) {
+    next = next.linear(plan.linear[0], plan.linear[1]);
+  }
+  return next;
+}
 
-  await sharp(merged, {
-    raw: { width: info.width, height: info.height, channels: 4 },
-  })
-    .png(encodeOptions)
-    .toFile(outputPath);
+async function encodeColoredImageToBuffer(inputPath, plan, attempt, meta) {
+  const sharp = getSharp();
+  if (attempt.format === 'jpeg') {
+    return applyColorPlanToPipeline(sharp(inputPath, { failOn: 'none' }), plan)
+      .removeAlpha()
+      .jpeg(attempt.options)
+      .toBuffer();
+  }
+
+  if (imageHasAlpha(meta)) {
+    const src = sharp(inputPath, { failOn: 'none' }).ensureAlpha();
+    const alphaRaw = await src.clone().extractChannel('alpha').raw().toBuffer();
+    const { data, info } = await src.clone().raw().toBuffer({ resolveWithObject: true });
+    prepareRgbForAlphaModulate(data, info.channels);
+
+    let rgbPipeline = sharp(data, {
+      raw: { width: info.width, height: info.height, channels: info.channels },
+    }).removeAlpha();
+    rgbPipeline = applyColorPlanToPipeline(rgbPipeline, plan);
+    const modulatedRgb = await rgbPipeline.raw().toBuffer();
+
+    const pixelCount = info.width * info.height;
+    const merged = Buffer.alloc(pixelCount * 4);
+    for (let p = 0; p < pixelCount; p++) {
+      const o = p * 4;
+      merged[o] = modulatedRgb[p * 3];
+      merged[o + 1] = modulatedRgb[p * 3 + 1];
+      merged[o + 2] = modulatedRgb[p * 3 + 2];
+      merged[o + 3] = alphaRaw[p];
+    }
+    unpremultiplyRgbAfterModulate(merged, 4);
+
+    return sharp(merged, {
+      raw: { width: info.width, height: info.height, channels: 4 },
+    })
+      .png(attempt.options)
+      .toBuffer();
+  }
+
+  return applyColorPlanToPipeline(sharp(inputPath, { failOn: 'none' }), plan)
+    .png(attempt.options)
+    .toBuffer();
 }
 
 async function rehashImage(inputPath, outputPath) {
   await ensureDirectoryExists(outputPath);
   const ext = path.extname(inputPath).toLowerCase();
   const originalSize = fs.statSync(inputPath).size;
-  const intensity = getFeatureFlags().IMAGE_COLOR_INTENSITY;
-  const mod = randomColorModulation();
+  const plan = buildImageColorPlan();
   const started = Date.now();
 
-  const image = getSharp()(inputPath, { failOn: 'none' });
-  const meta = await image.metadata();
-  const encode = buildImageEncodeOptions(ext, meta);
+  const meta = await getSharp()(inputPath, { failOn: 'none' }).metadata();
+  const attempts = buildImageEncodeAttempts(ext, meta);
+  const sizeLimit = Math.ceil(originalSize * IMAGE_MAX_SIZE_RATIO);
 
-  if (encode.type === 'jpeg') {
-    await image.modulate(mod).removeAlpha().jpeg(encode.options).toFile(outputPath);
-  } else if (imageHasAlpha(meta)) {
-    await rehashImageWithAlpha(inputPath, outputPath, mod, encode.options);
-  } else {
-    await image.modulate(mod).png(encode.options).toFile(outputPath);
+  let bestBuffer = null;
+  let bestSize = Infinity;
+
+  for (const attempt of attempts) {
+    const buffer = await encodeColoredImageToBuffer(inputPath, plan, attempt, meta);
+    if (buffer.length <= sizeLimit) {
+      await fs.writeFile(outputPath, buffer);
+      const ms = Date.now() - started;
+      if (ms > 3000) {
+        vlog(`Image done (${(ms / 1000).toFixed(1)}s, scheme=${plan.scheme}): ${path.basename(inputPath)}`);
+      }
+      return;
+    }
+    if (buffer.length < bestSize) {
+      bestSize = buffer.length;
+      bestBuffer = buffer;
+    }
   }
 
-  const outSize = fs.statSync(outputPath).size;
-  const ms = Date.now() - started;
-  const sizeDelta = (outSize - originalSize) / originalSize;
-  if (Math.abs(sizeDelta) > IMAGE_SIZE_WARN_RATIO) {
-    const sign = sizeDelta >= 0 ? '+' : '';
-    vlog(
-      `Image size ${sign}${(sizeDelta * 100).toFixed(0)}% (强度${intensity}): ${path.basename(inputPath)} ${originalSize}→${outSize}B`,
-    );
+  if (bestBuffer) {
+    await fs.writeFile(outputPath, bestBuffer);
+    if (bestSize > sizeLimit) {
+      console.warn(
+        `Image over ${IMAGE_MAX_SIZE_RATIO}x limit (scheme=${plan.scheme}): ${path.basename(inputPath)} ${originalSize}→${bestSize}B`,
+      );
+    }
+    return;
   }
-  if (ms > 3000) {
-    vlog(`Image done (${(ms / 1000).toFixed(1)}s): ${path.basename(inputPath)}`);
-  }
+
+  throw new Error(`Image encode failed: ${path.basename(inputPath)}`);
 }
 
 async function writeProcessedNativeFile(inputPath, outputPath, fileExt) {
@@ -1107,6 +1213,7 @@ function collectBundleAssetUuids(bundlePath, options = {}) {
 function preassignSharedUuids(bundlePaths, sharedUuidState) {
   let assigned = 0;
   for (const bundlePath of bundlePaths) {
+    if (isProtectedBundleDir(bundlePath)) continue;
     const packKeys = readBundlePackKeys(bundlePath);
     for (const id of packKeys) sharedUuidState.reservedShortIds.add(id);
 
@@ -1520,9 +1627,10 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
     processedUuids.add(item.uuid);
     if (item.renamedUUID) processedUuids.add(item.renamedUUID);
   }
-  for (const [orig, entry] of sharedState.uuidRegistry.entries()) {
-    processedUuids.add(orig);
-    processedUuids.add(entry.renamedUUID);
+  // 只跳过「已经是新 UUID」的文件，不能把 registry 的旧 key 加入跳过集：
+  // 共享资源常在 main 改名后，other 仍残留 uuid@f9941.json，必须继续迁移。
+  for (const entry of sharedState.uuidRegistry.values()) {
+    if (entry?.renamedUUID) processedUuids.add(entry.renamedUUID);
   }
 
   const packKeys = readBundlePackKeys(subpackageDir);
@@ -1566,6 +1674,84 @@ async function processOrphanImportJson(subpackageDir, results, globalReplaceComm
     const last = results[results.length - 1];
     if (last?.renamedUUID) processedUuids.add(last.renamedUUID);
   }
+}
+
+/**
+ * 全量扫尾：共享 UUID 在 A 包改名后，B 包残留的旧 import 侧车（如 @f9941）必须跟名。
+ * 并行处理 bundle 时 orphan 可能早于 registry 写入，故在全部 bundle 结束后再扫一次。
+ */
+async function migrateSharedUuidLeftoverImports(processedDir, results, globalReplaceCommands, sharedState) {
+  if (!sharedState?.uuidRegistry?.size) return 0;
+  const bundlePaths = collectAllBundlePaths(processedDir).filter((p) => !isProtectedBundleDir(p));
+  let migrated = 0;
+
+  for (const [origUuid, entry] of sharedState.uuidRegistry.entries()) {
+    if (!entry?.renamedUUID || entry.renamedUUID === origUuid) continue;
+    if (!STANDARD_UUID_REGEX.test(origUuid)) continue;
+
+    for (const bundlePath of bundlePaths) {
+      const origPrefix = origUuid.substring(0, 2);
+      const importSubDir = path.join(bundlePath, 'import', origPrefix);
+      if (!fs.existsSync(importSubDir)) continue;
+      if (isBundlePackImportKey(bundlePath, origUuid)) continue;
+
+      const foundFiles = listImportSidecarsForUuid(importSubDir, origUuid);
+      if (!foundFiles.length) continue;
+
+      const bundleParent = path.basename(path.dirname(bundlePath));
+      const bundleName = path.basename(bundlePath);
+      const bundleRel = path.join(bundleParent, bundleName);
+      const uuidAndExtra = {
+        uuid: origUuid,
+        afterAt: '',
+        extra: '',
+        fullName: origUuid,
+        hasAt: false,
+        notUUid: false,
+      };
+      const plan = resolveSharedRenamePlan(
+        uuidAndExtra,
+        '.json',
+        `${origUuid}.json`,
+        bundleRel,
+        sharedState.uuidRegistry,
+        { skipNativePaths: true, reservedShortIds: sharedState.reservedShortIds },
+      );
+      const migrations = await migrateImportSidecars(
+        bundlePath,
+        uuidAndExtra,
+        plan,
+        globalReplaceCommands,
+        bundleRel,
+        null,
+      );
+      if (!migrations.length) continue;
+
+      pushImportOnlyReplaceCommands(globalReplaceCommands, plan, {
+        uuidReplaceDedupe: sharedState.uuidReplaceDedupe,
+      });
+      patchBundleConfig(bundlePath, plan);
+      migrated += migrations.length;
+      results.push({
+        originalFile: path.basename(migrations[0].originalImportPath),
+        newFileName: path.basename(migrations[0].newImportPath),
+        uuid: origUuid,
+        renamedUUID: plan.renamedUUID,
+        subpackageRel: bundleRel,
+        importOnly: true,
+        crossBundleLeftover: true,
+        originalPath: migrations[0].originalImportPath,
+        newPath: migrations[0].newImportPath,
+        importMigrations: migrations,
+      });
+      vlog(`[CrossBundle] migrated leftover ${origUuid} in ${bundleRel} (${migrations.length} file(s))`);
+    }
+  }
+
+  if (migrated) {
+    console.log(`[Pipeline] cross-bundle leftover imports migrated: ${migrated}`);
+  }
+  return migrated;
 }
 
 async function recoverMissingNativeAssets(sourceDir, results) {
@@ -1982,6 +2168,10 @@ async function processSubpackage(subpackageDir, results, globalReplaceCommands, 
     vlog(`⏩ Skip entryui: ${subpackageDir}`);
     return;
   }
+  if (isProtectedBundleName(subpackageName)) {
+    console.log(`[Bundle] skip protected: ${subpackageName}`);
+    return;
+  }
 
   const nativeRoot = path.join(subpackageDir, 'native');
   const importDir = path.join(subpackageDir, 'import');
@@ -2252,6 +2442,12 @@ async function main(options = {}) {
   if (sharedUuidState.uuidRegistry.size) {
     console.log(`[Pipeline] shared UUID registry: ${sharedUuidState.uuidRegistry.size} unique asset(s)`);
   }
+  await migrateSharedUuidLeftoverImports(
+    processedDir,
+    results,
+    globalReplaceCommands,
+    sharedUuidState,
+  );
 
   await recoverMissingNativeAssets(sourceDir, results);
   pruneBundleAssetDirs(processedDir);
