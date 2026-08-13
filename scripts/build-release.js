@@ -40,29 +40,41 @@ const RELEASE_OBFUSCATION = {
 
 function runElectronBuilder(args) {
   const env = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' };
-  // 在 macOS 上交叉打包 Windows 时，优先用已缓存的 win Electron，避免误用本机 darwin dist
-  if (String(args).includes('--win')) {
-    const candidates = [
-      process.env.ELECTRON_CUSTOM_DIST,
-      path.join(os.tmpdir(), 'electron-win32-x64'),
-      path.join(os.homedir(), 'Library/Caches/electron/win32-x64-unpacked'),
-    ].filter(Boolean);
-    for (const candidate of candidates) {
-      if (fs.existsSync(path.join(candidate, 'electron.exe'))) {
-        env.ELECTRON_BUILDER_ELECTRON_DIST = candidate;
-        console.log(`   使用 Windows Electron: ${candidate}`);
-        break;
+  const extraFlags = [];
+  const isWinTarget = String(args).includes('--win');
+
+  if (isWinTarget) {
+    // Windows 本机：NSIS 安装向导；macOS 交叉编译：只能 zip（Wine/rcedit 不可用）
+    if (process.platform === 'win32') {
+      extraFlags.push('-c.win.target=nsis');
+      console.log('   Windows 目标: NSIS 安装向导');
+    } else {
+      extraFlags.push('-c.win.target=zip', '-c.win.signAndEditExecutable=false');
+      console.log('   非 Windows 主机：改为 zip 绿色包（请到 Windows 上打 NSIS）');
+      const candidates = [
+        process.env.ELECTRON_CUSTOM_DIST,
+        path.join(os.tmpdir(), 'electron-win32-x64'),
+        path.join(os.homedir(), 'Library/Caches/electron/win32-x64-unpacked'),
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        if (fs.existsSync(path.join(candidate, 'electron.exe'))) {
+          env.ELECTRON_BUILDER_ELECTRON_DIST = candidate;
+          extraFlags.push(`-c.electronDist=${JSON.stringify(candidate)}`);
+          console.log(`   使用 Windows Electron: ${candidate}`);
+          break;
+        }
       }
     }
   }
-  const distFlag = env.ELECTRON_BUILDER_ELECTRON_DIST
-    ? ` -c.electronDist="${env.ELECTRON_BUILDER_ELECTRON_DIST}"`
-    : '';
-  execSync(`npx electron-builder --config "${BUILDER_CONFIG}" ${args}${distFlag}`, {
-    cwd: ROOT,
-    stdio: 'inherit',
-    env,
-  });
+
+  execSync(
+    `npx electron-builder --config "${BUILDER_CONFIG}" ${args} ${extraFlags.join(' ')}`.trim(),
+    {
+      cwd: ROOT,
+      stdio: 'inherit',
+      env,
+    },
+  );
 }
 
 function smokeTestJsc(jscPath) {
@@ -131,7 +143,13 @@ async function build() {
   }
 
   console.log('\n✅ 发布构建完成！输出目录: dist/');
-  console.log('   发给客户: 安装包 + 单独生成的 license.lic');
+  if (process.argv.includes('--win') && process.platform === 'win32') {
+    console.log('   发给客户: dist/MilFun-Setup-*.exe + 单独的 license.lic');
+  } else if (process.argv.includes('--win')) {
+    console.log('   当前产出为 zip；要安装向导请在 Windows 执行: npm run build:release:win');
+  } else {
+    console.log('   发给客户: 安装包 + 单独生成的 license.lic');
+  }
   console.log('   勿发: app.js、license.js、license-keys/\n');
 }
 

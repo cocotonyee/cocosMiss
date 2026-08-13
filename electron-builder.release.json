@@ -50,25 +50,21 @@
   "win": {
     "target": [
       {
-        "target": "zip",
-        "arch": [
-          "x64"
-        ]
+        "target": "nsis",
+        "arch": ["x64"]
       }
-    ],
-    "signAndEditExecutable": false
+    ]
   },
   "nsis": {
     "oneClick": false,
     "allowToChangeInstallationDirectory": true,
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
-    "shortcutName": "MilFun"
+    "shortcutName": "MilFun",
+    "artifactName": "MilFun-Setup-${version}.${ext}"
   },
   "mac": {
-    "target": [
-      "dmg"
-    ],
+    "target": ["dmg"],
     "category": "public.app-category.developer-tools"
   }
 }
