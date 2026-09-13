@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fse = require('fs-extra');
@@ -352,6 +352,14 @@ ipcMain.handle('get-fingerprint', async () => {
   if (!depsReady) throw new Error('依赖尚未就绪');
   setupCoreEnv();
   return licenseService.getDeviceFingerprint();
+});
+
+ipcMain.handle('copy-fingerprint', async () => {
+  if (!depsReady) throw new Error('依赖尚未就绪');
+  setupCoreEnv();
+  const fp = await licenseService.getDeviceFingerprint();
+  clipboard.writeText(String(fp || ''));
+  return fp;
 });
 
 ipcMain.handle('import-license', async () => {

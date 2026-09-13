@@ -391,13 +391,12 @@ function bindEvents() {
   });
 
   btnFingerprint.addEventListener('click', async () => {
-    closeSettingsPopover();
     try {
-      const fp = await window.milfun.getFingerprint();
-      await navigator.clipboard.writeText(fp);
-      appendLog('success', 'Fingerprint copied');
+      await window.milfun.copyFingerprint();
+      closeSettingsPopover();
+      appendLog('success', '指纹已复制');
     } catch (err) {
-      appendLog('error', '复制失败: ' + err.message);
+      appendLog('error', '复制失败: ' + (err.message || String(err)));
     }
   });
 

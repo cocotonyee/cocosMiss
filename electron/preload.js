@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('milfun', {
   getAppInfo: () => ipcRenderer.invoke('get-app-info'),
   checkLicense: () => ipcRenderer.invoke('check-license'),
   getFingerprint: () => ipcRenderer.invoke('get-fingerprint'),
+  copyFingerprint: () => ipcRenderer.invoke('copy-fingerprint'),
   importLicense: () => ipcRenderer.invoke('import-license'),
   selectSourceDir: () => ipcRenderer.invoke('select-source-dir'),
   getFeatureConfig: () => ipcRenderer.invoke('get-feature-config'),
