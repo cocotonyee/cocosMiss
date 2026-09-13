@@ -648,7 +648,9 @@ function buildImageEncodeAttempts(ext, meta) {
 
   attempts.push({
     format: 'png',
-    options: { compressionLevel: 9, effort: 10, adaptiveFiltering: true },
+    options: hasAlpha
+      ? { compressionLevel: 9, effort: 10, adaptiveFiltering: true, palette: false }
+      : { compressionLevel: 9, effort: 10, adaptiveFiltering: true },
   });
 
   if (!hasAlpha) {
@@ -689,42 +691,36 @@ function imageHasAlpha(meta) {
   return Boolean(meta.hasAlpha || (meta.channels && meta.channels >= 4));
 }
 
-function prepareRgbForAlphaModulate(data, channels) {
-  if (channels < 4) return;
-  for (let i = 0; i < data.length; i += channels) {
-    const a = data[i + 3];
+/**
+ * Keep the original alpha byte. Fully transparent pixels are 0,0,0,0
+ * because Cocos premultiplied blend still adds RGB when alpha is 0.
+ * Semi-transparent edges lerp toward the colored RGB by alpha.
+ */
+function mergeColoredRgbWithOriginalAlpha(origRgba, coloredRgb, pixelCount) {
+  const merged = Buffer.alloc(pixelCount * 4);
+  for (let p = 0; p < pixelCount; p++) {
+    const i = p * 4;
+    const a = origRgba[i + 3];
+    merged[i + 3] = a;
     if (a === 0) {
-      data[i] = 0;
-      data[i + 1] = 0;
-      data[i + 2] = 0;
+      // Cocos 预乘混合下 a=0 仍会把 RGB 加到背景上，透明像素必须是 0,0,0,0
+      merged[i] = 0;
+      merged[i + 1] = 0;
+      merged[i + 2] = 0;
       continue;
     }
-    if (a < 255) {
-      const f = a / 255;
-      data[i] = Math.round(data[i] * f);
-      data[i + 1] = Math.round(data[i + 1] * f);
-      data[i + 2] = Math.round(data[i + 2] * f);
-    }
-  }
-}
-
-function unpremultiplyRgbAfterModulate(data, channels) {
-  if (channels < 4) return;
-  for (let i = 0; i < data.length; i += channels) {
-    const a = data[i + 3];
-    if (a === 0) {
-      data[i] = 0;
-      data[i + 1] = 0;
-      data[i + 2] = 0;
+    if (a === 255) {
+      merged[i] = coloredRgb[p * 3];
+      merged[i + 1] = coloredRgb[p * 3 + 1];
+      merged[i + 2] = coloredRgb[p * 3 + 2];
       continue;
     }
-    if (a < 255) {
-      const f = 255 / a;
-      data[i] = Math.min(255, Math.round(data[i] * f));
-      data[i + 1] = Math.min(255, Math.round(data[i + 1] * f));
-      data[i + 2] = Math.min(255, Math.round(data[i + 2] * f));
-    }
+    const t = a / 255;
+    merged[i] = Math.round(origRgba[i] + (coloredRgb[p * 3] - origRgba[i]) * t);
+    merged[i + 1] = Math.round(origRgba[i + 1] + (coloredRgb[p * 3 + 1] - origRgba[i + 1]) * t);
+    merged[i + 2] = Math.round(origRgba[i + 2] + (coloredRgb[p * 3 + 2] - origRgba[i + 2]) * t);
   }
+  return merged;
 }
 
 function applyColorPlanToPipeline(pipeline, plan) {
@@ -748,32 +744,31 @@ async function encodeColoredImageToBuffer(inputPath, plan, attempt, meta) {
   }
 
   if (imageHasAlpha(meta)) {
-    const src = sharp(inputPath, { failOn: 'none' }).ensureAlpha();
-    const alphaRaw = await src.clone().extractChannel('alpha').raw().toBuffer();
-    const { data, info } = await src.clone().raw().toBuffer({ resolveWithObject: true });
-    prepareRgbForAlphaModulate(data, info.channels);
+    const { data, info } = await sharp(inputPath, { failOn: 'none' })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const pixelCount = info.width * info.height;
+    const rgb = Buffer.alloc(pixelCount * 3);
+    for (let p = 0; p < pixelCount; p++) {
+      const i = p * 4;
+      rgb[p * 3] = data[i];
+      rgb[p * 3 + 1] = data[i + 1];
+      rgb[p * 3 + 2] = data[i + 2];
+    }
 
-    let rgbPipeline = sharp(data, {
-      raw: { width: info.width, height: info.height, channels: info.channels },
-    }).removeAlpha();
+    let rgbPipeline = sharp(rgb, {
+      raw: { width: info.width, height: info.height, channels: 3 },
+    });
     rgbPipeline = applyColorPlanToPipeline(rgbPipeline, plan);
     const modulatedRgb = await rgbPipeline.raw().toBuffer();
-
-    const pixelCount = info.width * info.height;
-    const merged = Buffer.alloc(pixelCount * 4);
-    for (let p = 0; p < pixelCount; p++) {
-      const o = p * 4;
-      merged[o] = modulatedRgb[p * 3];
-      merged[o + 1] = modulatedRgb[p * 3 + 1];
-      merged[o + 2] = modulatedRgb[p * 3 + 2];
-      merged[o + 3] = alphaRaw[p];
-    }
-    unpremultiplyRgbAfterModulate(merged, 4);
+    const merged = mergeColoredRgbWithOriginalAlpha(data, modulatedRgb, pixelCount);
+    const pngOptions = { ...attempt.options, palette: false };
 
     return sharp(merged, {
-      raw: { width: info.width, height: info.height, channels: 4 },
+      raw: { width: info.width, height: info.height, channels: 4, premultiplied: false },
     })
-      .png(attempt.options)
+      .png(pngOptions)
       .toBuffer();
   }
 
